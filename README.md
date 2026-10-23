@@ -61,9 +61,36 @@ Pair with Uniswap, OpenSea, Aave and more over WalletConnect v2. The agent revie
 | Sui | 🔜 Soon |
 | Bitcoin | 🔜 Soon |
 
-## Learn more
+## Setup + Learn more
 
 See [**spec.md**](spec.md) for every tool, the full security design, setup instructions, and worked examples. Agents and humans alike should start there.
+
+Ask your agent to setup the repo. After, just chat with them to create a wallet, show your balance, send, swap & more. 
+
+If it's confused about anything, tell it to read the `spec.md` file for context.
+
+### Example chat
+
+
+User prompt:
+
+```
+Send all the USDC and eth to 0x47b48420a2C6E57017F25Fe6709677cd62c09305
+```
+
+
+Agent output:
+
+```
+Task completed:
+
+I sent all the USDC and nearly all the ETH from Demo to 0x47b48420a2C6E57017F25Fe6709677cd62c09305 on Arbitrum One. Both transactions show success. Demo held nothing on Ethereum mainnet, so Arbitrum was the only place to send from.
+
+USDC: 9.127654, the full balance. Transaction 0x73ff…05fe.
+ETH: 0.002319996 ETH. Transaction 0x6bbd…470c.
+What's left in Demo: about 0.0000012 ETH, which is 1,171,052,026,000 wei. I couldn't send exactly everything because a transfer needs gas. I held back about 0.0000016 ETH so a fee swing wouldn't make the send fail, and the actual fee came to less.
+Pending record: the pending-transaction folder was empty after both sends.
+```
 
 ## Disclaimer
 
