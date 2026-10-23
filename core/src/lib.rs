@@ -17,4 +17,7 @@ pub mod store;
 pub mod swap_config;
 pub mod tools;
 pub mod vault;
+pub mod walletconnect;
+pub mod walletconnect_config;
+pub mod wc_service;
 pub mod zip;

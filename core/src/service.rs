@@ -12,6 +12,7 @@ use crate::crypto::{hex, sha2::sha256};
 use crate::eth::abi;
 use crate::eth::address::{Address, parse_address, to_checksum};
 use crate::eth::explorer::{self, HistoryKind};
+use crate::eth::journal::Journal;
 use crate::eth::networks::{self, Network};
 use crate::eth::ops::{self, TxIntent, num};
 use crate::eth::rpc::{CallRequest, RpcClient};
@@ -23,6 +24,8 @@ use crate::http::HttpClient;
 use crate::json::Value;
 use crate::store::{Store, WalletRecord, validate_wallet_name, write_new_private_file};
 use crate::vault;
+use crate::walletconnect::manager::WcManager;
+use crate::walletconnect::relay::UnavailableRelay;
 use crate::zip;
 
 pub const MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -77,7 +80,9 @@ pub struct IntentParams {
 
 pub struct WalletService {
     store: Store,
-    http: Rc<dyn HttpClient>,
+    pub(crate) journal: Journal,
+    pub(crate) http: Rc<dyn HttpClient>,
+    pub(crate) wc: RefCell<WcManager>,
     limiter: RefCell<AttemptLimiter>,
     iterations: u32,
     swap: SwapSettings,
@@ -185,8 +190,12 @@ pub fn export_payload(
 impl WalletService {
     pub fn new(store: Store, http: Rc<dyn HttpClient>) -> WalletService {
         WalletService {
+            journal: Journal::new(store.pending_dir()),
             store,
             http,
+            wc: RefCell::new(WcManager::new(Rc::new(UnavailableRelay(
+                "WalletConnect is not set up".to_string(),
+            )))),
             limiter: RefCell::new(AttemptLimiter::default()),
             iterations: vault::DEFAULT_ITERATIONS,
             swap: SwapSettings::default(),
@@ -196,6 +205,12 @@ impl WalletService {
 
     pub fn with_swap_settings(mut self, settings: SwapSettings) -> WalletService {
         self.swap = settings;
+        self
+    }
+
+    /// Connects the WalletConnect tools to a relay.
+    pub fn with_walletconnect(mut self, manager: WcManager) -> WalletService {
+        self.wc = RefCell::new(manager);
         self
     }
 
@@ -210,7 +225,11 @@ impl WalletService {
         self
     }
 
-    fn unlock(&self, name: &str, password: &str) -> Result<(WalletRecord, VaultContents), String> {
+    pub(crate) fn unlock(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> Result<(WalletRecord, VaultContents), String> {
         if password.is_empty() {
             return Err("password is required".to_string());
         }
@@ -240,7 +259,7 @@ impl WalletService {
         self.store.save(&record)
     }
 
-    fn network_of(contents: &VaultContents, chain_id: u64) -> Result<Network, String> {
+    pub(crate) fn network_of(contents: &VaultContents, chain_id: u64) -> Result<Network, String> {
         networks::find_network(&contents.networks, chain_id).ok_or_else(|| {
             format!(
                 "this wallet has no network with chain ID {chain_id}; add it with add_network first"
@@ -653,7 +672,7 @@ impl WalletService {
         let network = Self::network_of(&contents, chain_id)?;
         let owner = contents.address()?;
         let to = parse_address(to).map_err(|e| format!("'to': {e}"))?;
-        let rpc = ops::connect(&*self.http, &network)?;
+        let rpc = ops::connect_for_send(&*self.http, &network, &self.journal)?;
         let (intent, symbol, raw, decimals) =
             ops::transfer_intent(&rpc, &network, asset, &to, amount)?;
         let prepared = ops::prepare_tx(&rpc, &network, &owner, &intent, gas_limit)?;
@@ -683,7 +702,7 @@ impl WalletService {
         let (record, contents) = self.unlock(name, password)?;
         let network = Self::network_of(&contents, chain_id)?;
         let owner = contents.address()?;
-        let rpc = ops::connect(&*self.http, &network)?;
+        let rpc = ops::connect_for_send(&*self.http, &network, &self.journal)?;
         let intent = self.resolve_intent(&rpc, &network, params)?;
         let prepared = ops::prepare_tx(&rpc, &network, &owner, &intent, gas_limit)?;
         let key = contents.private_key_array()?;
@@ -829,7 +848,7 @@ impl WalletService {
         let owner = contents.address()?;
         let token = parse_address(token).map_err(|e| format!("'token': {e}"))?;
         let spender = parse_address(spender).map_err(|e| format!("'spender': {e}"))?;
-        let rpc = ops::connect(&*self.http, &network)?;
+        let rpc = ops::connect_for_send(&*self.http, &network, &self.journal)?;
         let Some((intent, info, allowance)) = ops::revoke_intent(&rpc, &owner, &token, &spender)?
         else {
             return Ok(Value::object(vec![
@@ -987,6 +1006,8 @@ impl WalletService {
                 out_decimals: to.decimals,
                 requested: amount,
                 sender: owner,
+                receiver,
+                slippage_bps: slippage_bps.unwrap_or(swap::DEFAULT_SLIPPAGE_BPS),
                 min_receive,
             },
             from,
@@ -1149,7 +1170,7 @@ impl WalletService {
     pub fn swap_tokens(&self, name: &str, password: &str, p: &SwapParams) -> Result<Value, String> {
         let (record, contents) = self.unlock(name, password)?;
         let network = Self::swap_network(&contents, p)?;
-        let rpc = ops::connect(&*self.http, &network)?;
+        let rpc = ops::connect_for_send(&*self.http, &network, &self.journal)?;
         let prep = self.prepare_swap(&rpc, &network, contents.address()?, p)?;
         let key = contents.private_key_array()?;
 
@@ -2514,6 +2535,7 @@ mod swap_tests {
         to: String,
         value: String,
         impact: String,
+        receiver: String,
     }
 
     impl Oo {
@@ -2529,6 +2551,7 @@ mod swap_tests {
                 to: ROUTER.into(),
                 value: "0".into(),
                 impact: "-0.05%".into(),
+                receiver: WALLET.into(),
             }
         }
 
@@ -2544,12 +2567,21 @@ mod swap_tests {
                 to: ROUTER.into(),
                 value: "10000000000000000".into(),
                 impact: "-0.10%".into(),
+                receiver: WALLET.into(),
             }
         }
 
         fn json(&self) -> String {
+            let addr = |a: &str| parse_address(a).unwrap();
+            let calldata = hex::encode_prefixed(&swap::test_router_calldata(
+                &addr(&self.in_addr),
+                &addr(&self.out_addr),
+                &addr(&self.receiver),
+                &U256::from_dec_str(&self.in_amount).unwrap(),
+                &U256::from_dec_str(&self.min_out).unwrap(),
+            ));
             format!(
-                r#"{{"code":200,"data":{{"inToken":{{"address":"{}","decimals":{},"symbol":"IN","usd":"1","volume":25}},"outToken":{{"address":"{}","decimals":{},"symbol":"OUT","usd":"1","volume":24.8}},"inAmount":"{}","outAmount":"{}","estimatedGas":174014,"minOutAmount":"{}","from":"{WALLET}","to":"{}","value":"{}","gasPrice":"1000000000","data":"0x90411a32","chainId":1,"price_impact":"{}","path":{{"routes":[{{"subRoutes":[{{"dexes":[{{"dex":"UniswapV4"}}]}}]}}]}}}}}}"#,
+                r#"{{"code":200,"data":{{"inToken":{{"address":"{}","decimals":{},"symbol":"IN","usd":"1","volume":25}},"outToken":{{"address":"{}","decimals":{},"symbol":"OUT","usd":"1","volume":24.8}},"inAmount":"{}","outAmount":"{}","estimatedGas":174014,"minOutAmount":"{}","from":"{WALLET}","to":"{}","value":"{}","gasPrice":"1000000000","data":"{}","chainId":1,"price_impact":"{}","path":{{"routes":[{{"subRoutes":[{{"dexes":[{{"dex":"UniswapV4"}}]}}]}}]}}}}}}"#,
                 self.in_addr,
                 self.in_decimals,
                 self.out_addr,
@@ -2559,6 +2591,7 @@ mod swap_tests {
                 self.min_out,
                 self.to,
                 self.value,
+                calldata,
                 self.impact
             )
         }
@@ -3070,10 +3103,17 @@ mod swap_tests {
 
     #[test]
     fn the_swap_goes_to_a_different_receiver_when_asked() {
-        let f = setup(&Oo::usdc_to_eth(), true);
+        let mut oo = Oo::usdc_to_eth();
+        oo.receiver = to_checksum(&[0x22; 20]);
+        let f = setup(&oo, true);
         let mut p = params();
         p.to_address = Some(to_checksum(&[0x22; 20]));
         let out = f.service.swap_tokens("w", PW, &p).unwrap();
+        // A host that ignores the requested recipient is refused and nothing is sent.
+        let f2 = setup(&Oo::usdc_to_eth(), true);
+        let err = f2.service.swap_tokens("w", PW, &p).unwrap_err();
+        assert!(err.contains("different address"), "{err}");
+        assert_eq!(sends(&f2), 0);
         assert_eq!(
             text(&out, &["to", "recipient"]),
             Some(to_checksum(&[0x22; 20]).as_str())

@@ -55,7 +55,7 @@ pub fn default_dir() -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
         .recursive(true)
@@ -64,7 +64,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)
 }
 
@@ -255,6 +255,11 @@ impl Store {
             ));
         }
         fs::remove_file(path).map_err(|e| format!("cannot delete wallet: {e}"))
+    }
+
+    /// Directory for records of transactions whose broadcast outcome is unknown.
+    pub fn pending_dir(&self) -> PathBuf {
+        self.dir.join("pending")
     }
 
     pub fn exports_dir(&self) -> Result<PathBuf, String> {

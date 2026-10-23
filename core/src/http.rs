@@ -189,11 +189,14 @@ pub mod mock {
             self
         }
 
-        /// Answers successive calls of `key` with `results` (raw `result` JSON or `ERR:<message>`).
+        /// Answers successive calls of `key` with `results` (raw `result` JSON, `ERR:<message>` for a node
+        /// error or `NET:<message>` for a transport failure).
         pub fn rpc_sequence(self, key: &str, results: Vec<&str>) -> RouterMock {
             let encoded = results
                 .into_iter()
                 .map(|r| match r.strip_prefix("ERR:") {
+                    // Not a node answer: the request fails before any response arrives.
+                    _ if r.starts_with("NET:") => r.to_string(),
                     Some(msg) => format!(r#"{{"error":{{"code":-32003,"message":"{msg}"}}}}"#),
                     None => format!(r#"{{"result":{r}}}"#),
                 })
@@ -248,6 +251,9 @@ pub mod mock {
                     _ => None,
                 }
             };
+            if let Some(msg) = queued.as_deref().and_then(|q| q.strip_prefix("NET:")) {
+                return Err(msg.to_string());
+            }
             let routes = self.rpc.borrow();
             let found = selector
                 .as_ref()

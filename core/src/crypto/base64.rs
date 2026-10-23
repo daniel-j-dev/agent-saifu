@@ -65,9 +65,25 @@ pub fn decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// URL-safe alphabet without padding (JWT segments).
+pub fn encode_url(data: &[u8]) -> String {
+    encode(data)
+        .trim_end_matches('=')
+        .replace('+', "-")
+        .replace('/', "_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_encoding_has_no_padding_or_unsafe_characters() {
+        assert_eq!(encode_url(&[0xfb, 0xff, 0xbf]), "-_-_");
+        assert_eq!(encode_url(b"f"), "Zg");
+        assert_eq!(encode_url(b"fo"), "Zm8");
+        assert_eq!(encode_url(b""), "");
+    }
 
     #[test]
     fn rfc4648_vectors() {

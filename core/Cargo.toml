@@ -6,9 +6,15 @@ edition = "2024"
 
 [dependencies]
 aes-gcm = "0.11.1"
+chacha20poly1305 = "0.11"
+ed25519-dalek = { version = "3", default-features = false, features = ["zeroize"] }
 getrandom = "0.4.3"
 k256 = { version = "0.14.0", features = ["ecdsa", "arithmetic"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
+webpki-roots = "1"
+x25519-dalek = { version = "3", default-features = false, features = ["zeroize", "static_secrets"] }
 
 [profile.dev]
 opt-level = 2

@@ -747,6 +747,155 @@ fn definitions() -> Vec<Tool> {
                 )
             },
         },
+        Tool {
+            name: "wc_pair",
+            description: "Connect to a dapp with WalletConnect. Give it the connection URI the dapp shows (starts with \"wc:\"; the text behind its QR code). Waits for the dapp's session proposal and returns what the dapp is asking for. Nothing is connected until you call wc_approve_session. No wallet is unlocked.",
+            params: vec![
+                req(
+                    "uri",
+                    Kind::Text,
+                    "The WalletConnect v2 pairing URI, e.g. wc:<topic>@2?relay-protocol=irn&symKey=...",
+                ),
+                opt(
+                    "wait_seconds",
+                    Kind::Integer,
+                    "How long to wait for the dapp's proposal (default 20, max 60).",
+                ),
+            ],
+            handler: |s, a| s.wc_pair(a.str("uri")?, a.opt_u64("wait_seconds")?),
+        },
+        Tool {
+            name: "wc_list_proposals",
+            description: "List the dapp connection proposals waiting for an answer (what each dapp asks for, and whether this wallet can satisfy it). Proposals expire after 5 minutes.",
+            params: vec![],
+            handler: |s, _| s.wc_list_proposals(),
+        },
+        Tool {
+            name: "wc_approve_session",
+            description: "Approve a dapp's connection proposal with a wallet. This reveals the wallet's address to the dapp, so it needs the wallet name, the chain ID and the password. chain_id plus additional_chain_ids must cover every chain the dapp requires (see wc_list_proposals) and may only include chains the dapp asked for; the wallet must have a network for each. Only the methods this wallet supports are granted (transactions, personal_sign, typed data); eth_sign is never granted.",
+            params: vec![
+                req(
+                    "proposal_id",
+                    Kind::Text,
+                    "The proposal_id from wc_pair or wc_list_proposals.",
+                ),
+                wallet(),
+                chain_id(),
+                opt(
+                    "additional_chain_ids",
+                    Kind::TextList,
+                    "Further chain IDs to share with the dapp (required by it or optional).",
+                ),
+                password(),
+            ],
+            handler: |s, a| {
+                let extra = a
+                    .str_list("additional_chain_ids")?
+                    .iter()
+                    .map(|c| {
+                        c.trim()
+                            .parse::<u64>()
+                            .map_err(|_| format!("'{c}' is not a valid chain ID"))
+                    })
+                    .collect::<Result<Vec<u64>, String>>()?;
+                s.wc_approve_session(
+                    a.u64("proposal_id")?,
+                    a.str("wallet_name")?,
+                    a.u64("chain_id")?,
+                    &extra,
+                    a.str("password")?,
+                )
+            },
+        },
+        Tool {
+            name: "wc_reject_session",
+            description: "Decline a dapp's connection proposal. Nothing is shared with the dapp.",
+            params: vec![req(
+                "proposal_id",
+                Kind::Text,
+                "The proposal_id to decline.",
+            )],
+            handler: |s, a| s.wc_reject_session(a.u64("proposal_id")?),
+        },
+        Tool {
+            name: "wc_list_sessions",
+            description: "List the dapps currently connected (wallet, chains, permitted methods). Addresses are not shown. Sessions last up to 7 days but are kept only while this server runs.",
+            params: vec![],
+            handler: |s, _| s.wc_list_sessions(),
+        },
+        Tool {
+            name: "wc_disconnect_session",
+            description: "Disconnect a dapp. It can no longer send requests and is told the session ended.",
+            params: vec![req(
+                "session_topic",
+                Kind::Text,
+                "The session_topic from wc_list_sessions (a unique prefix of at least 8 characters works).",
+            )],
+            handler: |s, a| s.wc_disconnect_session(a.str("session_topic")?),
+        },
+        Tool {
+            name: "wc_list_requests",
+            description: "List the requests connected dapps are waiting on: transactions to send or sign, messages and typed data to sign. Shows the dapp, method, chain and a summary. Use wc_review_request for the full costs and expected outcome. Requests expire after about 5 minutes.",
+            params: vec![],
+            handler: |s, _| s.wc_list_requests(),
+        },
+        Tool {
+            name: "wc_review_request",
+            description: "Review a dapp request before answering it. Unlocks the wallet for this call. For transactions it dry-runs the transaction and reports whether it would succeed, what it sends or approves (token transfers and approvals are decoded), the network fee and whether the wallet can afford it. For messages and typed data it shows exactly what would be signed, with warnings. Signs and sends nothing.",
+            params: vec![
+                req(
+                    "request_id",
+                    Kind::Text,
+                    "The request_id from wc_list_requests.",
+                ),
+                wallet(),
+                chain_id(),
+                password(),
+            ],
+            handler: |s, a| {
+                s.wc_review_request(
+                    a.u64("request_id")?,
+                    a.str("wallet_name")?,
+                    a.u64("chain_id")?,
+                    a.str("password")?,
+                )
+            },
+        },
+        Tool {
+            name: "wc_approve_request",
+            description: "Approve a dapp request: sign it and send the answer back to the dapp. eth_sendTransaction is signed AND BROADCAST (spends funds); eth_signTransaction only signs; personal_sign and typed data produce a signature. The wallet name must be the wallet the dapp is connected to, and chain_id must be the request's chain. Review the request first with wc_review_request. A transaction that would fail is not sent.",
+            params: vec![
+                req(
+                    "request_id",
+                    Kind::Text,
+                    "The request_id from wc_list_requests.",
+                ),
+                wallet(),
+                chain_id(),
+                password(),
+            ],
+            handler: |s, a| {
+                s.wc_approve_request(
+                    a.u64("request_id")?,
+                    a.str("wallet_name")?,
+                    a.u64("chain_id")?,
+                    a.str("password")?,
+                )
+            },
+        },
+        Tool {
+            name: "wc_reject_request",
+            description: "Reject a dapp request. Nothing is signed; the dapp is told the user rejected it. No password needed.",
+            params: vec![
+                req("request_id", Kind::Text, "The request_id to reject."),
+                opt(
+                    "reason",
+                    Kind::Text,
+                    "Optional short reason shown to the dapp.",
+                ),
+            ],
+            handler: |s, a| s.wc_reject_request(a.u64("request_id")?, a.opt_str("reason")?),
+        },
     ]
 }
 
@@ -942,6 +1091,16 @@ mod tests {
             "view_private_key",
             "export_wallet",
             "revoke_token_approval",
+            "wc_pair",
+            "wc_list_proposals",
+            "wc_approve_session",
+            "wc_reject_session",
+            "wc_list_sessions",
+            "wc_disconnect_session",
+            "wc_list_requests",
+            "wc_review_request",
+            "wc_approve_request",
+            "wc_reject_request",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -1226,6 +1385,91 @@ mod tests {
             r#"{"wallet_name":"w","password":"wrong-password","chain_id":1,"contract":"0x2222222222222222222222222222222222222222"}"#,
         );
         assert!(err && msg.as_str().unwrap().contains("incorrect password"));
+    }
+
+    #[test]
+    fn walletconnect_approvals_require_wallet_chain_and_password() {
+        let (_f, tb) = toolbox_fixture();
+        let find = |name: &str| tb.tools.iter().find(|t| t.name == name).unwrap();
+        for name in [
+            "wc_approve_session",
+            "wc_approve_request",
+            "wc_review_request",
+        ] {
+            for required in ["wallet_name", "chain_id", "password"] {
+                assert!(
+                    find(name)
+                        .params
+                        .iter()
+                        .any(|p| p.name == required && p.required),
+                    "{name} must require {required}"
+                );
+            }
+        }
+        // Looking, connecting and declining never touch a wallet.
+        for name in [
+            "wc_pair",
+            "wc_list_proposals",
+            "wc_reject_session",
+            "wc_list_sessions",
+            "wc_disconnect_session",
+            "wc_list_requests",
+            "wc_reject_request",
+        ] {
+            assert!(
+                !find(name)
+                    .params
+                    .iter()
+                    .any(|p| p.name == "password" || p.name == "wallet_name"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn walletconnect_tools_report_a_missing_relay_and_bad_arguments() {
+        let (_f, tb) = toolbox_fixture();
+        let uri = format!(
+            "wc:{}@2?relay-protocol=irn&symKey={}",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        let (err, msg) = call(&tb, "wc_pair", &format!(r#"{{"uri":"{uri}"}}"#));
+        assert!(
+            err && msg
+                .as_str()
+                .unwrap()
+                .contains("WalletConnect is not set up"),
+            "{msg:?}"
+        );
+        let (err, msg) = call(&tb, "wc_pair", r#"{"uri":"wc:abc"}"#);
+        assert!(
+            err && msg.as_str().unwrap().contains("no version"),
+            "{msg:?}"
+        );
+        let (err, msg) = call(&tb, "wc_pair", r#"{}"#);
+        assert!(
+            err && msg
+                .as_str()
+                .unwrap()
+                .contains("missing required argument 'uri'")
+        );
+        let (err, msg) = call(
+            &tb,
+            "wc_approve_session",
+            r#"{"proposal_id":"1","wallet_name":"W","chain_id":1,"password":"password-1","additional_chain_ids":["x"]}"#,
+        );
+        assert!(
+            err && msg.as_str().unwrap().contains("not a valid chain ID"),
+            "{msg:?}"
+        );
+        let (err, msg) = call(&tb, "wc_reject_request", r#"{"request_id":"abc"}"#);
+        assert!(err && msg.as_str().unwrap().contains("non-negative integer"));
+        let (err, _) = call(&tb, "wc_list_requests", r#"{}"#);
+        assert!(!err, "listing with nothing connected is not an error");
+        let (err, msg) = call(&tb, "wc_list_sessions", "{}");
+        assert!(!err);
+        assert_eq!(msg.get("count").and_then(Value::as_u64), Some(0));
     }
 
     #[test]

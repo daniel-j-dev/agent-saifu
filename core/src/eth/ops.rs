@@ -3,9 +3,10 @@
 use super::abi::{self, AbiType};
 use super::address::{Address, parse_address, to_checksum};
 use super::explorer::{sanitize_text, sanitize_text_max, tx_url};
+use super::journal::{Journal, PendingTx};
 use super::networks::Network;
 use super::prices::{PriceClient, usd_json, usd_value};
-use super::rpc::{CallRequest, RpcClient, with_gas_buffer};
+use super::rpc::{CallRequest, RpcClient, RpcError, with_gas_buffer};
 use super::tokens::{CustomToken, known_tokens};
 use super::tx::{Fees, UnsignedTx};
 use super::u256::U256;
@@ -33,6 +34,7 @@ pub struct TokenInfo {
 
 #[derive(Debug, Clone)]
 pub struct PreparedTx {
+    pub from: Address,
     pub tx: UnsignedTx,
     pub gas_estimate: u64,
 }
@@ -54,6 +56,16 @@ pub fn connect<'a>(http: &'a dyn HttpClient, network: &Network) -> Result<RpcCli
         ));
     }
     Ok(rpc)
+}
+
+/// Like [`connect`], for clients that will broadcast: each send is recorded in `journal` first,
+/// so an unknown outcome is reconciled rather than paid twice.
+pub fn connect_for_send<'a>(
+    http: &'a dyn HttpClient,
+    network: &Network,
+    journal: &'a Journal,
+) -> Result<RpcClient<'a>, String> {
+    connect(http, network).map(|rpc| rpc.with_journal(journal))
 }
 
 pub fn is_native(asset: &str) -> bool {
@@ -308,6 +320,111 @@ fn insufficient_funds_message(network: &Network, needed: &U256, balance: &U256) 
     )
 }
 
+fn is_known_tx_error(err: &RpcError) -> bool {
+    match err {
+        RpcError::Node { message, .. } => {
+            let m = message.to_lowercase();
+            m.contains("already known")
+                || m.contains("known transaction")
+                || m.contains("already exists")
+        }
+        _ => false,
+    }
+}
+
+/// Settles a transaction whose broadcast outcome was unknown (response lost, timeout) before
+/// anything new is sent from the same wallet. The node's pending nonce already counts such a
+/// transaction, so a retry would otherwise sign the next nonce and pay a second time.
+/// Errors when the earlier transaction turned out to be accepted (do not send again) or its fate
+/// is still unknown; `Ok` when it is safe to continue.
+pub fn reconcile_pending(
+    rpc: &RpcClient<'_>,
+    network: &Network,
+    from: &Address,
+) -> Result<(), String> {
+    let Some(journal) = rpc.journal() else {
+        return Ok(());
+    };
+    let Some(pending) = journal.load(network.chain_id, from)? else {
+        return Ok(());
+    };
+    let hash = hex::encode_prefixed(&pending.hash);
+    let url = tx_url(&network.block_explorer_url, &pending.hash);
+    let unresolved = |why: &RpcError| {
+        format!(
+            "an earlier transaction from this wallet (hash {hash}, nonce {}) has an unknown outcome and could not be checked yet ({}). Nothing was sent now, to avoid paying twice. Check {url} and try again later.",
+            pending.nonce,
+            sanitize_text_max(&why.to_string(), 200),
+        )
+    };
+    let accepted = |how: &str| {
+        journal.clear(network.chain_id, from);
+        format!(
+            "an earlier transaction from this wallet (hash {hash}, nonce {}) {how}. It was NOT sent again and nothing new was sent now. Check {url} for its status; if you still want another payment, make a new request.",
+            pending.nonce,
+        )
+    };
+    match rpc.transaction_by_hash(&pending.hash) {
+        Ok(Some(_)) => return Err(accepted("was accepted by the network")),
+        Ok(None) => {}
+        Err(e) => return Err(unresolved(&e)),
+    }
+    // Not visible: resubmit the identical signed bytes (same nonce and hash, so never a second payment).
+    match rpc.send_raw_transaction(&pending.raw) {
+        Ok(_) => Err(accepted(
+            "had not reached the network and was submitted now",
+        )),
+        Err(e) if is_known_tx_error(&e) => Err(accepted("was accepted by the network")),
+        Err(e @ (RpcError::Transport(_) | RpcError::Malformed(_))) => Err(unresolved(&e)),
+        // The node rejected it for good (e.g. its nonce was used by another transaction).
+        Err(RpcError::Node { .. }) => {
+            journal.clear(network.chain_id, from);
+            Ok(())
+        }
+    }
+}
+
+/// Broadcasts `signed`. The transaction is recorded first; the record is dropped once the node
+/// answers either way, and kept when the outcome is unknown (transport failure, garbled reply).
+fn broadcast_recorded(
+    rpc: &RpcClient<'_>,
+    network: &Network,
+    prepared: &PreparedTx,
+    signed: &super::tx::SignedTx,
+) -> Result<[u8; 32], String> {
+    let Some(journal) = rpc.journal() else {
+        return rpc
+            .send_raw_transaction(&signed.raw)
+            .map_err(|e| failure_message("broadcast failed", &e));
+    };
+    journal
+        .record(&PendingTx {
+            chain_id: network.chain_id,
+            from: prepared.from,
+            nonce: prepared.tx.nonce,
+            hash: signed.hash,
+            raw: signed.raw.clone(),
+        })
+        .map_err(|e| format!("nothing was sent: {e}"))?;
+    match rpc.send_raw_transaction(&signed.raw) {
+        Ok(hash) => {
+            journal.clear(network.chain_id, &prepared.from);
+            Ok(hash)
+        }
+        Err(e @ RpcError::Node { .. }) => {
+            journal.clear(network.chain_id, &prepared.from);
+            Err(failure_message("broadcast failed", &e))
+        }
+        Err(e) => Err(format!(
+            "broadcast outcome unknown: {}. The transaction (hash {}, nonce {}) may or may not have been sent. Do NOT retry the payment: the next send from this wallet on this network first checks this transaction and will not pay again if it went through. Check {}.",
+            sanitize_text_max(&e.to_string(), 200),
+            hex::encode_prefixed(&signed.hash),
+            prepared.tx.nonce,
+            tx_url(&network.block_explorer_url, &signed.hash),
+        )),
+    }
+}
+
 /// Builds a signable transaction: nonce, fees, gas limit; checks the sender can afford it.
 pub fn prepare_tx(
     rpc: &RpcClient<'_>,
@@ -316,6 +433,7 @@ pub fn prepare_tx(
     intent: &TxIntent,
     gas_limit_override: Option<u64>,
 ) -> Result<PreparedTx, String> {
+    reconcile_pending(rpc, network, from)?;
     let balance = rpc
         .balance(from)
         .map_err(|e| format!("cannot read balance: {e}"))?;
@@ -352,6 +470,7 @@ pub fn prepare_tx(
         ));
     }
     Ok(PreparedTx {
+        from: *from,
         tx,
         gas_estimate: estimate,
     })
@@ -373,9 +492,7 @@ pub fn sign_and_maybe_send(
         ("gas_limit", num(prepared.tx.gas_limit)),
     ];
     if broadcast {
-        let hash = rpc
-            .send_raw_transaction(&signed.raw)
-            .map_err(|e| failure_message("broadcast failed", &e))?;
+        let hash = broadcast_recorded(rpc, network, prepared, &signed)?;
         pairs.push(("broadcast", Value::Bool(true)));
         pairs.push((
             "transaction_hash",
@@ -1254,6 +1371,121 @@ mod tests {
         key[31] = 1;
         let err = sign_and_maybe_send(&rpc, &net(), &prepared, &key, true).unwrap_err();
         assert!(err.contains("broadcast failed") && err.contains("nonce too low"));
+    }
+
+    fn send_intent() -> TxIntent {
+        TxIntent {
+            to: OTHER,
+            value: U256::from_u64(1),
+            data: vec![],
+        }
+    }
+
+    fn key_one() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[31] = 1;
+        key
+    }
+
+    /// Broadcasts once with a lost response and returns the journal holding the unknown outcome.
+    fn lost_broadcast(dir: &crate::store::testutil::TempDir) -> (Journal, PendingTx) {
+        let journal = Journal::new(dir.0.join("pending"));
+        let http = base_router().rpc_sequence("eth_sendRawTransaction", vec!["NET:timed out"]);
+        let rpc = connect_for_send(&http, &net(), &journal).unwrap();
+        let prepared = prepare_tx(&rpc, &net(), &OWNER, &send_intent(), None).unwrap();
+        let err = sign_and_maybe_send(&rpc, &net(), &prepared, &key_one(), true).unwrap_err();
+        assert!(err.contains("outcome unknown") && err.contains("Do NOT retry"));
+        let pending = journal.load(1, &OWNER).unwrap().expect("record kept");
+        assert_eq!(pending.nonce, 5);
+        assert!(err.contains(&hex::encode_prefixed(&pending.hash)));
+        (journal, pending)
+    }
+
+    #[test]
+    fn lost_broadcast_response_blocks_a_second_payment() {
+        let dir = crate::store::testutil::TempDir::new();
+        let (journal, _) = lost_broadcast(&dir);
+        // The node did accept it: the pending nonce moved on and the hash is known.
+        let http = base_router()
+            .rpc("eth_getTransactionCount", "\"0x6\"")
+            .rpc("eth_getTransactionByHash", r#"{"nonce":"0x5"}"#);
+        let rpc = connect_for_send(&http, &net(), &journal).unwrap();
+        let err = prepare_tx(&rpc, &net(), &OWNER, &send_intent(), None).unwrap_err();
+        assert!(err.contains("NOT sent again"), "{err}");
+        assert!(
+            !http
+                .sent_methods()
+                .contains(&"eth_sendRawTransaction".to_string())
+        );
+        assert_eq!(journal.load(1, &OWNER), Ok(None));
+    }
+
+    #[test]
+    fn lost_broadcast_that_never_arrived_is_resubmitted_not_repaid() {
+        let dir = crate::store::testutil::TempDir::new();
+        let (journal, pending) = lost_broadcast(&dir);
+        let node_hash = hex::encode_prefixed(&pending.hash);
+        let http = base_router()
+            .rpc("eth_getTransactionByHash", "null")
+            .rpc("eth_sendRawTransaction", &format!("\"{node_hash}\""));
+        let rpc = connect_for_send(&http, &net(), &journal).unwrap();
+        let err = prepare_tx(&rpc, &net(), &OWNER, &send_intent(), None).unwrap_err();
+        assert!(err.contains("submitted now"), "{err}");
+        let sends = http
+            .sent_methods()
+            .iter()
+            .filter(|m| *m == "eth_sendRawTransaction")
+            .count();
+        assert_eq!(sends, 1);
+        assert_eq!(journal.load(1, &OWNER), Ok(None));
+    }
+
+    #[test]
+    fn unreachable_node_keeps_the_record_and_sends_nothing() {
+        let dir = crate::store::testutil::TempDir::new();
+        let (journal, _) = lost_broadcast(&dir);
+        let http = base_router().rpc_sequence("eth_getTransactionByHash", vec!["NET:down"]);
+        let rpc = connect_for_send(&http, &net(), &journal).unwrap();
+        let err = prepare_tx(&rpc, &net(), &OWNER, &send_intent(), None).unwrap_err();
+        assert!(err.contains("unknown outcome"), "{err}");
+        assert!(journal.load(1, &OWNER).unwrap().is_some());
+
+        let http = base_router()
+            .rpc("eth_getTransactionByHash", "null")
+            .rpc_sequence("eth_sendRawTransaction", vec!["NET:down"]);
+        let rpc = connect_for_send(&http, &net(), &journal).unwrap();
+        assert!(prepare_tx(&rpc, &net(), &OWNER, &send_intent(), None).is_err());
+        assert!(journal.load(1, &OWNER).unwrap().is_some());
+    }
+
+    #[test]
+    fn record_is_dropped_once_the_node_rejects_the_transaction() {
+        let dir = crate::store::testutil::TempDir::new();
+        let (journal, _) = lost_broadcast(&dir);
+        let http = base_router()
+            .rpc("eth_getTransactionByHash", "null")
+            .rpc_error("eth_sendRawTransaction", -32000, "nonce too low", None);
+        let rpc = connect_for_send(&http, &net(), &journal).unwrap();
+        assert!(prepare_tx(&rpc, &net(), &OWNER, &send_intent(), None).is_ok());
+        assert_eq!(journal.load(1, &OWNER), Ok(None));
+
+        let http = base_router().rpc_error("eth_sendRawTransaction", -32000, "underpriced", None);
+        let rpc = connect_for_send(&http, &net(), &journal).unwrap();
+        let prepared = prepare_tx(&rpc, &net(), &OWNER, &send_intent(), None).unwrap();
+        assert!(sign_and_maybe_send(&rpc, &net(), &prepared, &key_one(), true).is_err());
+        assert_eq!(journal.load(1, &OWNER), Ok(None));
+    }
+
+    #[test]
+    fn successful_broadcast_leaves_no_record() {
+        let dir = crate::store::testutil::TempDir::new();
+        let journal = Journal::new(dir.0.join("pending"));
+        let node_hash = hex::encode_prefixed(&[0xabu8; 32]);
+        let http = base_router().rpc("eth_sendRawTransaction", &format!("\"{node_hash}\""));
+        let rpc = connect_for_send(&http, &net(), &journal).unwrap();
+        let prepared = prepare_tx(&rpc, &net(), &OWNER, &send_intent(), None).unwrap();
+        sign_and_maybe_send(&rpc, &net(), &prepared, &key_one(), true).unwrap();
+        assert_eq!(journal.load(1, &OWNER), Ok(None));
     }
 
     #[test]

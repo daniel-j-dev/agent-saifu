@@ -416,7 +416,124 @@ pub struct Expectation {
     pub out_decimals: u32,
     pub requested: U256,
     pub sender: Address,
+    /// Who must receive the bought tokens: the wallet itself or the caller's `to_address`.
+    pub receiver: Address,
+    /// Slippage the request asked for; the quote's guaranteed minimum may not be looser.
+    pub slippage_bps: u32,
     pub min_receive: Option<U256>,
+}
+
+/// The swap instructions inside the router calldata, as the router itself will read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterSwap {
+    pub src_token: Address,
+    pub dst_token: Address,
+    pub dst_receiver: Address,
+    pub amount: U256,
+    pub min_return: U256,
+}
+
+/// `swap(address caller, (address srcToken, address dstToken, address srcReceiver,
+/// address dstReceiver, uint256 amount, uint256 minReturnAmount, uint256 guaranteedAmount,
+/// uint256 flags, address referrer, bytes permit) desc, (uint256,uint256,uint256,bytes)[] calls)`
+const ROUTER_SWAP_SELECTOR: [u8; 4] = [0x90, 0x41, 0x1a, 0x32];
+const DESC_WORDS: usize = 10;
+/// Slack between the requested slippage and the quote's minimum before it counts as too loose.
+const SLIPPAGE_TOLERANCE_BPS: u32 = 50;
+
+fn word(args: &[u8], index_bytes: usize) -> Result<&[u8], String> {
+    args.get(index_bytes..index_bytes + 32)
+        .ok_or_else(|| "the swap calldata is truncated".to_string())
+}
+
+fn word_address(w: &[u8]) -> Result<Address, String> {
+    if w[..12].iter().any(|b| *b != 0) {
+        return Err("the swap calldata holds a malformed address".to_string());
+    }
+    Ok(w[12..].try_into().expect("20 bytes"))
+}
+
+/// Reads the recipient, tokens, amount and minimum return out of the router's `swap` call.
+/// Any other function, or a layout it cannot read with certainty, is an error: the wallet
+/// only signs calldata it has understood.
+pub fn decode_router_swap(data: &[u8]) -> Result<RouterSwap, String> {
+    if data.len() < 4 || data[..4] != ROUTER_SWAP_SELECTOR {
+        return Err(
+            "the swap calldata calls a router function this wallet cannot verify".to_string(),
+        );
+    }
+    let args = &data[4..];
+    let offset = U256::from_be_bytes(word(args, 32)?)?
+        .to_u64()
+        .and_then(|o| usize::try_from(o).ok())
+        .filter(|o| *o <= args.len())
+        .ok_or("the swap calldata is malformed")?;
+    let desc = args
+        .get(offset..)
+        .filter(|d| d.len() >= DESC_WORDS * 32)
+        .ok_or("the swap calldata is truncated")?;
+    Ok(RouterSwap {
+        src_token: word_address(word(desc, 0)?)?,
+        dst_token: word_address(word(desc, 32)?)?,
+        dst_receiver: word_address(word(desc, 96)?)?,
+        amount: U256::from_be_bytes(word(desc, 128)?)?,
+        min_return: U256::from_be_bytes(word(desc, 160)?)?,
+    })
+}
+
+/// Checks that what the calldata will do is what was asked for and what the quote claims.
+fn check_calldata(data: &[u8], q: &Quote, e: &Expectation) -> Result<(), String> {
+    let swap = decode_router_swap(data).map_err(|m| format!("refusing: {m}"))?;
+    let same_token = |actual: &Address, native: bool, wanted: &Address| {
+        if native {
+            is_native_address(e.chain_id, actual)
+        } else {
+            actual == wanted
+        }
+    };
+    if !same_token(&swap.src_token, e.in_native, &e.in_token) {
+        return Err("refusing: the swap calldata sells a different token than requested".into());
+    }
+    if !same_token(&swap.dst_token, e.out_native, &e.out_token) {
+        return Err("refusing: the swap calldata buys a different token than requested".into());
+    }
+    if swap.dst_receiver != e.receiver {
+        return Err(
+            "refusing: the swap calldata would deliver the bought tokens to a different address than requested"
+                .into(),
+        );
+    }
+    if swap.amount != q.in_amount || swap.amount > e.requested {
+        return Err("refusing: the swap calldata sells a different amount than quoted".into());
+    }
+    if swap.min_return < q.min_out_amount {
+        return Err("refusing: the swap calldata guarantees less than the quote's minimum".into());
+    }
+    if let Some(floor) = &e.min_receive
+        && swap.min_return < *floor
+    {
+        return Err("refusing: the swap calldata guarantees less than your min_receive".into());
+    }
+    Ok(())
+}
+
+/// The quote's guaranteed minimum may not undercut its expected amount by more than the
+/// requested slippage (plus a small tolerance): the host cannot hide a bad price in it.
+fn check_slippage(q: &Quote, e: &Expectation) -> Result<(), String> {
+    let kept = 10_000 - (e.slippage_bps + SLIPPAGE_TOLERANCE_BPS).min(10_000);
+    let (Some(min_scaled), Some(out_scaled)) = (
+        q.min_out_amount.checked_mul_u64(10_000),
+        q.out_amount.checked_mul_u64(u64::from(kept)),
+    ) else {
+        return Err("the quote's amounts are out of range".to_string());
+    };
+    if min_scaled < out_scaled {
+        return Err(format!(
+            "refusing: the quote's guaranteed minimum is more than {}% below its expected amount",
+            format_percent(e.slippage_bps)
+        ));
+    }
+    Ok(())
 }
 
 /// Verifies a quote before anything is signed. Returns the transaction to send.
@@ -424,6 +541,8 @@ pub struct Expectation {
 /// Guards against a quote for different tokens than requested, one that spends more than
 /// asked or sends extra native currency, one aimed at a contract other than OpenOcean's
 /// published router, a guaranteed minimum below the caller's floor, and extreme price impact.
+/// The calldata itself is decoded and must name the requested tokens, amount and recipient and
+/// a minimum return at least the quote's, so a dishonest API host cannot redirect the output.
 pub fn check_quote<'a>(q: &'a Quote, e: &Expectation) -> Result<&'a TxDetails, String> {
     let tx = q
         .transaction
@@ -488,6 +607,8 @@ pub fn check_quote<'a>(q: &'a Quote, e: &Expectation) -> Result<&'a TxDetails, S
     {
         return Err("refusing: the transaction is for a different chain".to_string());
     }
+    check_slippage(q, e)?;
+    check_calldata(&tx.data, q, e)?;
     if let Some(floor) = &e.min_receive
         && q.min_out_amount < *floor
     {
@@ -505,6 +626,39 @@ pub fn check_quote<'a>(q: &'a Quote, e: &Expectation) -> Result<&'a TxDetails, S
         ));
     }
     Ok(tx)
+}
+
+/// Router `swap` calldata with the given instructions (and no extra calls), for tests.
+#[cfg(test)]
+pub(crate) fn test_router_calldata(
+    src: &Address,
+    dst: &Address,
+    receiver: &Address,
+    amount: &U256,
+    min_return: &U256,
+) -> Vec<u8> {
+    fn addr_word(a: &Address) -> Vec<u8> {
+        let mut w = vec![0u8; 12];
+        w.extend_from_slice(a);
+        w
+    }
+    let mut out = ROUTER_SWAP_SELECTOR.to_vec();
+    out.extend(addr_word(&[0xb1; 20]));
+    out.extend(U256::from_u64(0x60).to_be_bytes());
+    out.extend(U256::from_u64(0x1c0).to_be_bytes());
+    out.extend(addr_word(src));
+    out.extend(addr_word(dst));
+    out.extend(addr_word(&[0xb1; 20]));
+    out.extend(addr_word(receiver));
+    out.extend(amount.to_be_bytes());
+    out.extend(min_return.to_be_bytes());
+    out.extend(min_return.to_be_bytes());
+    out.extend(U256::from_u64(2).to_be_bytes());
+    out.extend(addr_word(&[0xf8; 20]));
+    out.extend(U256::from_u64(0x140).to_be_bytes());
+    out.extend([0u8; 32]);
+    out.extend([0u8; 32]);
+    out
 }
 
 // ---- reports ----------------------------------------------------------------
@@ -717,8 +871,16 @@ mod tests {
     }
 
     fn body() -> String {
+        let calldata = hex::encode_prefixed(&test_router_calldata(
+            &USDC,
+            &EEEE_NATIVE,
+            &SENDER,
+            &U256::from_u64(25_000_000),
+            &U256::from_u64(10_200_000_000_000_000),
+        ));
         format!(
-            r#"{{"code":200,"data":{{"inToken":{{"address":"0xa0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0","decimals":6,"symbol":"USDC","name":"USD Coin","usd":"1.0","volume":25}},"outToken":{{"address":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","decimals":18,"symbol":"ETH","name":"Ether","usd":"2400.5","volume":24.81}},"inAmount":"25000000","outAmount":"10300000000000000","estimatedGas":174014,"minOutAmount":"10200000000000000","from":"0x1111111111111111111111111111111111111111","to":"{ROUTER_LOWER}","value":"0","gasPrice":"1000000000","data":"0x90411a32","chainId":1,"rfqDeadline":0,"gmxFee":0,"price_impact":"-0.05%","path":{{"from":"0xa0","to":"0xee","parts":10,"routes":[{{"parts":10,"percentage":100,"subRoutes":[{{"from":"a","to":"b","parts":10,"dexes":[{{"dex":"UniswapV4","id":"x","parts":10,"percentage":100,"fee":0}}]}}]}}]}},"dexes":[{{"dexIndex":0,"dexCode":"UniswapV2","swapAmount":"1"}}]}}}}"#
+            r#"{{"code":200,"data":{{"inToken":{{"address":"0xa0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0","decimals":6,"symbol":"USDC","name":"USD Coin","usd":"1.0","volume":25}},"outToken":{{"address":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","decimals":18,"symbol":"ETH","name":"Ether","usd":"2400.5","volume":24.81}},"inAmount":"25000000","outAmount":"10300000000000000","estimatedGas":174014,"minOutAmount":"10200000000000000","from":"0x1111111111111111111111111111111111111111","to":"{ROUTER_LOWER}","value":"0","gasPrice":"1000000000","data":"{CALLDATA}","chainId":1,"rfqDeadline":0,"gmxFee":0,"price_impact":"-0.05%","path":{{"from":"0xa0","to":"0xee","parts":10,"routes":[{{"parts":10,"percentage":100,"subRoutes":[{{"from":"a","to":"b","parts":10,"dexes":[{{"dex":"UniswapV4","id":"x","parts":10,"percentage":100,"fee":0}}]}}]}}]}},"dexes":[{{"dexIndex":0,"dexCode":"UniswapV2","swapAmount":"1"}}]}}}}"#,
+            CALLDATA = calldata
         )
     }
 
@@ -743,6 +905,8 @@ mod tests {
             out_decimals: 18,
             requested: U256::from_u64(25_000_000),
             sender: SENDER,
+            receiver: SENDER,
+            slippage_bps: 100,
             min_receive: None,
         }
     }
@@ -959,14 +1123,20 @@ mod tests {
             (tx.value, tx.chain_id, tx.from),
             (U256::ZERO, Some(1), Some(SENDER))
         );
-        assert_eq!(tx.data, vec![0x90, 0x41, 0x1a, 0x32]);
+        assert_eq!(tx.data[..4], [0x90, 0x41, 0x1a, 0x32]);
+        let swap = decode_router_swap(&tx.data).unwrap();
+        assert_eq!(swap.dst_receiver, SENDER);
+        assert_eq!(swap.amount, U256::from_u64(25_000_000));
     }
 
     #[test]
     fn estimated_gas_may_be_a_string_and_calldata_is_optional() {
         let b = body().replace(r#""estimatedGas":174014"#, r#""estimatedGas":"174014""#);
         assert_eq!(parse_swap(&b).unwrap().estimated_gas, Some(174_014));
-        let no_tx = body().replace(r#""data":"0x90411a32","#, "");
+        let full = body();
+        let start = full.find(r#""data":"0x90411a32"#).unwrap();
+        let end = start + full[start..].find("\",").unwrap() + 2;
+        let no_tx = format!("{}{}", &full[..start], &full[end..]);
         assert!(parse_swap(&no_tx).unwrap().transaction.is_none());
     }
 
@@ -1000,7 +1170,7 @@ mod tests {
                 r#""to":"0x6352a56caadc4f1e25cd6c75970fa768a3304e64""#,
                 r#""to":"nope""#,
             ),
-            (r#""data":"0x90411a32""#, r#""data":"zz""#),
+            (r#""data":"0x90411a32"#, r#""data":"zz90411a32"#),
         ] {
             assert!(parse_swap(&body().replace(from, to)).is_err(), "{from}");
         }
@@ -1020,6 +1190,127 @@ mod tests {
     }
 
     // ---- guards ----
+
+    fn with_calldata(mutate: impl FnOnce(&mut [Address; 3], &mut U256, &mut U256)) -> Quote {
+        let mut addrs = [USDC, EEEE_NATIVE, SENDER];
+        let mut amount = U256::from_u64(25_000_000);
+        let mut min_return = U256::from_u64(10_200_000_000_000_000);
+        mutate(&mut addrs, &mut amount, &mut min_return);
+        let mut q = quote();
+        q.transaction.as_mut().unwrap().data =
+            test_router_calldata(&addrs[0], &addrs[1], &addrs[2], &amount, &min_return);
+        q
+    }
+
+    #[test]
+    fn calldata_must_match_the_request() {
+        let e = expectation();
+        let rejects = |q: Quote| check_quote(&q, &e).unwrap_err();
+        assert!(check_quote(&with_calldata(|_, _, _| {}), &e).is_ok());
+        let thief = [0x66; 20];
+        assert!(rejects(with_calldata(|a, _, _| a[2] = thief)).contains("different address"));
+        assert!(rejects(with_calldata(|a, _, _| a[0] = thief)).contains("sells a different token"));
+        assert!(rejects(with_calldata(|a, _, _| a[1] = thief)).contains("buys a different token"));
+        assert!(
+            rejects(with_calldata(|_, amt, _| *amt = U256::from_u64(24_000_000)))
+                .contains("different amount")
+        );
+        assert!(
+            rejects(with_calldata(|_, amt, _| *amt = U256::from_u64(26_000_000)))
+                .contains("different amount")
+        );
+        assert!(
+            rejects(with_calldata(|_, _, min| *min = U256::ONE)).contains("less than the quote")
+        );
+    }
+
+    #[test]
+    fn calldata_minimum_must_meet_the_callers_floor() {
+        let mut e = expectation();
+        e.min_receive = Some(U256::from_u64(10_250_000_000_000_000));
+        let q = with_calldata(|_, _, _| {});
+        assert!(check_quote(&q, &e).unwrap_err().contains("min_receive"));
+    }
+
+    #[test]
+    fn unreadable_calldata_is_refused() {
+        let e = expectation();
+        let rejects = |data: Vec<u8>| {
+            let mut q = quote();
+            q.transaction.as_mut().unwrap().data = data;
+            check_quote(&q, &e).unwrap_err()
+        };
+        assert!(rejects(vec![0x90, 0x41, 0x1a, 0x32]).contains("truncated"));
+        assert!(rejects(vec![0xde, 0xad, 0xbe, 0xef, 1, 2, 3]).contains("cannot verify"));
+        let mut other = test_router_calldata(&USDC, &EEEE_NATIVE, &SENDER, &U256::ONE, &U256::ONE);
+        other[0] ^= 1;
+        assert!(rejects(other).contains("cannot verify"));
+        let mut dirty = test_router_calldata(&USDC, &EEEE_NATIVE, &SENDER, &U256::ONE, &U256::ONE);
+        dirty[4 + 0x60 + 5] = 1;
+        assert!(rejects(dirty).contains("malformed address"));
+        let mut far = test_router_calldata(&USDC, &EEEE_NATIVE, &SENDER, &U256::ONE, &U256::ONE);
+        far[4 + 63] = 0xff;
+        far[4 + 40] = 0xff;
+        assert!(rejects(far).contains("malformed"));
+    }
+
+    #[test]
+    fn a_receiver_other_than_the_wallet_is_accepted_only_when_requested() {
+        let friend = [0x77; 20];
+        let mut e = expectation();
+        e.receiver = friend;
+        let q = with_calldata(|a, _, _| a[2] = friend);
+        assert!(check_quote(&q, &e).is_ok());
+        assert!(check_quote(&with_calldata(|_, _, _| {}), &e).is_err());
+    }
+
+    #[test]
+    fn a_loose_guaranteed_minimum_is_refused() {
+        let e = expectation();
+        let mut q = with_calldata(|_, _, _| {});
+        q.min_out_amount = U256::from_u64(1);
+        q.transaction.as_mut().unwrap().data = test_router_calldata(
+            &USDC,
+            &EEEE_NATIVE,
+            &SENDER,
+            &q.in_amount,
+            &q.min_out_amount,
+        );
+        assert!(
+            check_quote(&q, &e)
+                .unwrap_err()
+                .contains("below its expected")
+        );
+        let mut wide = expectation();
+        wide.slippage_bps = 1000;
+        q.min_out_amount = U256::from_u64(9_500_000_000_000_000);
+        q.transaction.as_mut().unwrap().data = test_router_calldata(
+            &USDC,
+            &EEEE_NATIVE,
+            &SENDER,
+            &q.in_amount,
+            &q.min_out_amount,
+        );
+        assert!(check_quote(&q, &wide).is_ok());
+        assert!(check_quote(&q, &e).is_err());
+    }
+
+    #[test]
+    fn real_openocean_calldata_decodes() {
+        let head = "90411a32000000000000000000000000b100a5b2591dd099040a5ab76efe682a6d8a48a2000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000001c0000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e5831000000000000000000000000eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee000000000000000000000000b100a5b2591dd099040a5ab76efe682a6d8a48a2000000000000000000000000c2f69890a917c4501706f2d156674f9332851edc00000000000000000000000000000000000000000000000000000000002dc6c000000000000000000000000000000000000000000000000000045ab502ba36e5000000000000000000000000000000000000000000000000000465f77c4a514f0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000f8564095b5b0edfc8f334b82bf04a57b27dca4cd0000000000000000000000000000000000000000000000000000000000000140";
+        let swap = decode_router_swap(&hex::decode(head).unwrap()).unwrap();
+        assert_eq!(
+            swap.src_token,
+            built_in("0xaf88d065e77c8cC2239327C5EDb3A432268e5831")
+        );
+        assert_eq!(swap.dst_token, EEEE_NATIVE);
+        assert_eq!(
+            swap.dst_receiver,
+            built_in("0xc2F69890A917c4501706F2d156674f9332851eDc")
+        );
+        assert_eq!(swap.amount, U256::from_u64(3_000_000));
+        assert_eq!(swap.min_return, U256::from_u64(1_225_633_388_181_221));
+    }
 
     #[test]
     fn a_normal_quote_passes() {
@@ -1075,6 +1366,13 @@ mod tests {
         let mut q = quote();
         q.in_token.address = [0x55; 20];
         q.transaction.as_mut().unwrap().value = q.in_amount;
+        q.transaction.as_mut().unwrap().data = test_router_calldata(
+            &[0; 20],
+            &EEEE_NATIVE,
+            &SENDER,
+            &q.in_amount,
+            &q.min_out_amount,
+        );
         assert!(check_quote(&q, &e).is_ok());
         q.transaction.as_mut().unwrap().value = q.in_amount.checked_add(&U256::ONE).unwrap();
         assert!(check_quote(&q, &e).is_err());
@@ -1084,6 +1382,13 @@ mod tests {
     fn selling_less_than_requested_and_small_impacts_are_fine() {
         let mut q = quote();
         q.in_amount = U256::from_u64(24_000_000);
+        q.transaction.as_mut().unwrap().data = test_router_calldata(
+            &USDC,
+            &EEEE_NATIVE,
+            &SENDER,
+            &q.in_amount,
+            &q.min_out_amount,
+        );
         q.price_impact = Some(-4.99);
         assert!(check_quote(&q, &expectation()).is_ok());
         q.price_impact = None;

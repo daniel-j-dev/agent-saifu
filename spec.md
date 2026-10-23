@@ -51,18 +51,46 @@ Every tool that touches a wallet needs the wallet's password; the wallet is unlo
 - `view_seed_phrase`, `view_private_key` (wallet_name, password)
 - `export_wallet` (wallet_name, password, encryption_key, optional file_name) - writes a ZIP to `exports/` whose single entry is the seed phrase and private key encrypted with MetaMask's vault scheme under the given key. Never overwrites files.
 - `revoke_token_approval` (wallet_name, chain_id, password, token, spender) - useful for revoking smart-contract token approvals (sets the ERC-20 allowance to zero).
+- `wc_pair` (uri, optional wait_seconds) - added by request; connects to any dapp over WalletConnect v2. Give it the `wc:` URI the dapp shows. It waits for the dapp's session proposal and returns what the dapp asks for (chains, methods, whether this wallet can satisfy it). Nothing is shared until the proposal is approved. No wallet is unlocked.
+- `wc_list_proposals`, `wc_reject_session` (proposal_id) - waiting connection proposals; decline one.
+- `wc_approve_session` (proposal_id, wallet_name, chain_id, password, optional additional_chain_ids) - approves a proposal with a wallet; this is the only step that reveals the address, and only to the dapp. The chains must cover everything the dapp requires and may only include chains the dapp asked for; the wallet needs a network for each.
+- `wc_list_sessions`, `wc_disconnect_session` (session_topic) - connected dapps (wallet, chains, methods; never addresses); end one.
+- `wc_list_requests` - what connected dapps are waiting on, with a summary (decoded token transfers/approvals, message text, typed data). No password; the signer's address is left out.
+- `wc_review_request` (request_id, wallet_name, chain_id, password) - the expected costs and outcome. For transactions: a dry run (would it succeed or revert), what is sent or approved in plain language (`expected_outcome`), the network fee (max and expected, in the native coin and USDC), and whether the wallet can afford it. For messages and typed data: exactly what would be signed, with warnings. Signs and sends nothing.
+- `wc_approve_request` (request_id, wallet_name, chain_id, password) - signs and answers the dapp. `eth_sendTransaction` is signed and broadcast; `eth_signTransaction` only signs; `personal_sign` and `eth_signTypedData(_v4)` return a signature.
+- `wc_reject_request` (request_id, optional reason) - tells the dapp the user rejected it. Nothing is signed. No password.
 
 ### Swaps (OpenOcean)
 
-- **No API key, account or environment variable.** Swaps use an OpenOcean v4 swap API host (`https://open-api.de1.exchange/v4`, endpoint `/:chain/swap`). The host is the `OPENOCEAN_API_BASE_URL` setting in [core/src/swap_config.rs](core/src/swap_config.rs). Whoever runs that host supplies the transaction data the wallet signs, so only point it at a host you trust.
+- **No API key, account or environment variable.** Swaps use an OpenOcean v4 swap API host (`https://open-api.de1.exchange/v4`, endpoint `/:chain/swap`). The host is the `OPENOCEAN_API_BASE_URL` setting in [core/src/swap_config.rs](core/src/swap_config.rs). The host supplies the transaction data the wallet signs, but the wallet decodes that data and refuses anything that does not match your request (see the safety checks below).
 - **Same-chain only.** OpenOcean's API swaps within one chain; its cross-chain swaps exist only in its web widget, and non-EVM chains (Solana, and so on) need a whitelisted key. So `to_chain_id` must equal `from_chain_id` (a different value returns an explanatory error), and there is no `to_blockchain` option: swaps such as ETH to BTC or SUI are not possible through this API. What *is* supported is `to_address`: an optional address on the same chain that receives the bought tokens instead of the wallet itself.
 - **Chains:** the 41 chains OpenOcean lists for its swap API (Ethereum, BNB Chain, Base, Polygon, Arbitrum, Optimism, Avalanche, and others). The wallet must have the network (see `add_network`). The wallet only ever approves or sends to OpenOcean's published router contract.
 - **Fee:** 0.7% (70 bps) of the amount sold, sent to OpenOcean as `referrer` / `referrerFee`. It is shown in every quote as `service_fee`. **Set your fee address in [core/src/swap_config.rs](core/src/swap_config.rs)** (`SWAP_FEE_RECIPIENT`); the rate is `SWAP_FEE_BPS` in the same file. While the address is empty no fee is charged (the server prints a notice to stderr at startup). An invalid address, or a rate outside 1-500 bps, makes the server refuse to start.
 - **Costs to know about:** OpenOcean also applies its own tiered fee on public-API swaps (0.01% stable pairs, 0.1% correlated, 0.25% common, 0.5% exotic tokens), inside the swap, and its docs say it keeps 20% of the referrer fee by default. Its docs do not describe how referrer fees are paid out; confirm that with OpenOcean and check your fee address after a first swap.
-- **Safety checks before signing:** the quote must be for the requested tokens (decimals included), may not sell more than requested or send extra native currency, must target OpenOcean's router, must meet `min_receive`, and may not have a price impact worse than 5%. The approval is for exactly the sold amount, never unlimited. OpenOcean text (route names, errors) is length-limited and stripped of control characters before it reaches the agent.
+- **Safety checks before signing:** the quote must be for the requested tokens (decimals included), may not sell more than requested or send extra native currency, must target OpenOcean's router, must meet `min_receive`, and may not have a price impact worse than 5%. The router calldata is also decoded locally (`swap(...)` on OpenOcean's router) and must sell the requested token and the quoted amount, buy the requested token, **deliver it to the wallet (or the requested `to_address`)** and guarantee a minimum return at least the quote's (and your `min_receive`); the quote's guaranteed minimum may also not be looser than the requested slippage (plus 0.5%). So a dishonest or compromised API host cannot redirect the output or hide a bad price; calldata the wallet cannot decode is refused and nothing is sent. The approval is for exactly the sold amount, never unlimited. OpenOcean text (route names, errors) is length-limited and stripped of control characters before it reaches the agent.
 - **Rate limit:** 2 requests per second on the free API. **Known issue:** OpenOcean's Cloudflare bot protection challenged the quote and swap endpoints (HTTP 403) when tested from a cloud server, so swaps may fail from some networks; the tools then say so and send nothing.
 
 Only Ethereum wallets can be created and used for now. Chain IDs select networks such as Base or Arbitrum; chains without chain IDs will not require one.
+
+### WalletConnect (any dapp)
+
+The wallet speaks the WalletConnect v2 Sign protocol as the wallet side, so any dapp that shows a WalletConnect QR code or `wc:` link can connect: Uniswap, OpenSea, Aave, and so on. The flow for an agent:
+
+1. `wc_pair` with the dapp's `wc:` URI, then look at the proposal it returns.
+2. `wc_approve_session` (proposal_id, **wallet_name**, **chain_id**, **password**) to connect, or `wc_reject_session`.
+3. When the dapp asks for something, `wc_list_requests` shows it. `wc_review_request` shows the expected costs and outcome. `wc_approve_request` (request_id, **wallet_name**, **chain_id**, **password**) signs / sends and answers the dapp; `wc_reject_request` declines.
+
+- **Setup: a project ID is needed.** WalletConnect's relay requires a free project ID. Create one at https://dashboard.walletconnect.com/ and set the `WALLETCONNECT_PROJECT_ID` environment variable, or put it in `WALLETCONNECT_PROJECT_ID` in [core/src/walletconnect_config.rs](core/src/walletconnect_config.rs) (the variable wins). Without it every `wc_*` tool says what is missing and the rest of the wallet is unaffected.
+- **Wallet, chain and password on every approval.** `wc_approve_session`, `wc_review_request` and `wc_approve_request` all require the wallet name, chain ID and password. The wallet must be the one the dapp's session was connected with, and the chain must be the one the request is for; otherwise the call fails before anything is unlocked or signed and the request stays open. Passwords are checked (and rate limited) like every other tool.
+- **Per-action unlock.** The wallet is unlocked only inside `wc_approve_session`, `wc_review_request` and `wc_approve_request`, and locked again when the call returns. A session holds only WalletConnect keys, never wallet secrets or the address.
+- **Supported methods:** `eth_sendTransaction`, `eth_signTransaction`, `personal_sign`, `eth_signTypedData` and `eth_signTypedData_v4` (EIP-712). `eth_sign` is never granted: it signs an arbitrary hash and cannot be reviewed, so a dapp that requires it cannot be connected. Contract creation is refused. EVM chains only (`eip155`); a dapp that requires another namespace (e.g. Solana) cannot be connected.
+- **Transactions.** The wallet picks the gas limit, fees and nonce itself; the dapp's own `gas`, fee and `nonce` fields are ignored (and the review says so). A transaction that would revert (gas estimation fails) or that the wallet cannot afford is not signed or sent, and the request stays open so it can be rejected. The request's `from` must be this wallet's address and any `chainId` in the transaction must match the request, or it is refused. Token transfers, approvals (with an unlimited-allowance warning) and `setApprovalForAll` are decoded in plain language; other contract calls show the target and function selector and are flagged as not decodable.
+- **Messages and typed data.** `personal_sign` shows the message as text when it is readable and warns when it is binary (e.g. a bare hash). Typed data shows the domain and message, warns about permits, marketplace orders and near-unlimited amounts, and is refused when the domain's `chainId` differs from the request's chain. EIP-712 hashing is implemented in this repository and checked against the EIP's published vectors.
+- **Answering twice is impossible.** A request is closed the moment it is approved, even if the dapp could not be reached afterwards, so an already-sent transaction can never be approved a second time. Requests expire after about 5 minutes (or the dapp's own expiry); proposals after 5 minutes; sessions after 7 days.
+- **Sessions are in memory only.** Sessions last while the MCP server process runs. After a restart the dapp must connect again. Nothing about a session is written to disk, which keeps addresses out of any unencrypted file.
+- **Dapp identity is self-declared.** The name and URL a dapp reports are not verified (WalletConnect's Verify API is not used); every proposal says so. Text from dapps is length-limited and stripped of control characters before it reaches the agent.
+- **Privacy and transport.** All messages are end-to-end encrypted (X25519 key agreement, HKDF-SHA256, ChaCha20-Poly1305) as the protocol specifies; the relay sees only encrypted payloads and topics. The relay connection is `wss://` with certificate checking, authenticated with a fresh Ed25519 client key (JWT) per connection. A background thread keeps the relay connection so requests arrive while the agent is idle; they are picked up on the next `wc_*` call (call `wc_list_requests` to check).
+- **Limits.** Not implemented: WalletConnect Auth / `wc_sessionAuthenticate` (sign-in only, no session), session updates by the wallet, and chain-switching helper methods (`wallet_switchEthereumChain`, `wallet_addEthereumChain`). Use `add_network` to give the wallet a network, then connect with that chain.
 
 ### Security design
 
@@ -72,19 +100,23 @@ Only Ethereum wallets can be created and used for now. Chain IDs select networks
 - Passwords must be at least 8 characters (export keys 12). Five wrong passwords lock a wallet for 60 seconds.
 - Secrets are wiped from memory after each call where possible; request/response buffers are zeroed. Secrets are never logged and are never included in error messages.
 - Text coming from third parties (token names, explorer data) is shortened and stripped of control characters before it reaches an agent; RPC URLs must be https (http only for localhost) and may not be literal private-network IPv4 addresses.
+- No double payments on a lost broadcast response. Before every broadcast the signed transaction (hash, nonce, raw bytes; no keys) is saved in `$AGENT_SAIFU_HOME/pending/` and removed once the node answers. If the response is lost (timeout, network error), the record stays and the error says the outcome is unknown and not to retry. The next send from that wallet on that network first looks the transaction up: if the node has it, nothing is sent and the agent is told it was already accepted; if not, the identical signed bytes are resubmitted (same nonce, so never a second payment) and reported; if the node can't be reached, nothing is sent until it can be checked.
 
 ### Dependencies
 
-Hashing (SHA-2, Keccak), HMAC, PBKDF2, base64/hex, BIP39/BIP32, RLP, ABI, transaction signing, ZIP and JSON are implemented in this repository and tested against published vectors. Only primitives that are risky to hand-roll use crates, each checked against the RustSec advisory database (all advisories are fixed in the versions locked in `Cargo.lock`) and crates.io download counts:
+Hashing (SHA-2, Keccak), HMAC, PBKDF2, HKDF, base64/base58/hex, BIP39/BIP32, RLP, ABI, EIP-191 and EIP-712 signing, transaction signing, the WalletConnect protocol logic, ZIP and JSON are implemented in this repository and tested against published vectors. Only primitives that are risky to hand-roll use crates, each checked against the RustSec advisory database (all advisories are fixed in the versions locked in `Cargo.lock`) and crates.io download counts:
 
 - `k256` 0.14 (RustCrypto; secp256k1 ECDSA, constant-time) - ~90M downloads
 - `aes-gcm` 0.11 (RustCrypto; NCC Group audited) - ~186M downloads
 - `getrandom` 0.4 (OS randomness) - ~2.3B downloads
 - `ureq` 3.5 with `rustls` (HTTPS for RPC / price / explorer requests, redirects disabled) - ~238M downloads
+- `chacha20poly1305` 0.11 (RustCrypto; WalletConnect message encryption) - ~100M downloads
+- `x25519-dalek` 3.0 (WalletConnect key agreement) and `ed25519-dalek` 3.0 (relay authentication), both dalek-cryptography - ~87M and ~248M downloads. The RustSec advisories for `ed25519-dalek` (RUSTSEC-2022-0093, fixed in 2.0) and `curve25519-dalek` (RUSTSEC-2024-0344, fixed in 4.1.3) are fixed in the locked versions.
+- `tungstenite` 0.30 (WebSocket framing for the relay, handshake only, no TLS of its own) - ~360M downloads; its advisory RUSTSEC-2023-0065 is fixed since 0.20.1. TLS is the same `rustls` (ring) already used by `ureq`, with `webpki-roots` for certificates.
 
 ### External services
 
-Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). Custom networks supply their own RPC and explorer.
+Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). The WalletConnect relay (`relay.walletconnect.org`, needs a free project ID). Custom networks supply their own RPC and explorer.
 
 ## Example input
 
@@ -306,6 +338,47 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_network","arguments":{"wallet_name":"Demo","password":"demo-password-123","chain_id":8453}}}' | cargo run -q
+```
+
+### WalletConnect
+
+Sessions live in the server process, so run these in one process (piped lines, or an MCP client that keeps the server running). Set the project ID first (see the WalletConnect section above) and use a wallet that has a network for the chain the dapp wants:
+
+```bash
+export WALLETCONNECT_PROJECT_ID=<your project id>
+```
+
+Connect: copy the `wc:` URI from the dapp, then pair, check the proposal and approve it with the wallet name, chain ID and password:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wc_pair","arguments":{"uri":"wc:<topic>@2?relay-protocol=irn&symKey=<key>&expiryTimestamp=<ts>"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wc_approve_session","arguments":{"proposal_id":"<proposal_id from step 1>","wallet_name":"Demo","chain_id":1,"password":"demo-password-123"}}}' \
+  | cargo run -q
+```
+
+See what a connected dapp is asking for, review its costs and outcome, then approve (signs, and broadcasts for `eth_sendTransaction`) or reject:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wc_list_requests"}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wc_review_request","arguments":{"request_id":"<request_id>","wallet_name":"Demo","chain_id":1,"password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wc_approve_request","arguments":{"request_id":"<request_id>","wallet_name":"Demo","chain_id":1,"password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wc_reject_request","arguments":{"request_id":"<request_id>"}}}' | cargo run -q
+```
+
+Disconnect a dapp (use `wc_list_sessions` for the topic):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wc_disconnect_session","arguments":{"session_topic":"<session_topic>"}}}' | cargo run -q
 ```
 
 ### Several requests in one session

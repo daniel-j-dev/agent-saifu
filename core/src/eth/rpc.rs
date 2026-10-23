@@ -5,6 +5,7 @@ use std::fmt;
 
 use super::abi;
 use super::address::{Address, to_checksum};
+use super::journal::Journal;
 use super::tx::Fees;
 use super::u256::U256;
 use crate::crypto::hex;
@@ -84,6 +85,7 @@ pub struct RpcClient<'a> {
     http: &'a dyn HttpClient,
     url: String,
     next_id: Cell<u64>,
+    journal: Option<&'a Journal>,
 }
 
 fn quantity(v: &Value, what: &str) -> Result<U256, RpcError> {
@@ -112,7 +114,18 @@ impl<'a> RpcClient<'a> {
             http,
             url: url.to_string(),
             next_id: Cell::new(1),
+            journal: None,
         }
+    }
+
+    /// Makes broadcasts through this client crash-safe: see [`Journal`].
+    pub fn with_journal(mut self, journal: &'a Journal) -> RpcClient<'a> {
+        self.journal = Some(journal);
+        self
+    }
+
+    pub fn journal(&self) -> Option<&'a Journal> {
+        self.journal
     }
 
     pub fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, RpcError> {
