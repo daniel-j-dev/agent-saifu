@@ -35,9 +35,31 @@ impl Default for UreqClient {
     }
 }
 
-fn describe(status: u16) -> String {
-    format!("HTTP status {status}")
+/// `HTTP status 400: <short body>`. APIs usually explain what was wrong in the error body.
+/// Web pages (e.g. a bot-protection challenge) are summarised instead of echoed.
+pub fn describe(status: u16, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.starts_with('<') {
+        let blocked = trimmed.contains("Just a moment") || trimmed.contains("cloudflare");
+        return if blocked {
+            format!("HTTP status {status} (blocked by Cloudflare bot protection)")
+        } else {
+            format!("HTTP status {status} (the server returned a web page instead of data)")
+        };
+    }
+    let snippet: String = trimmed
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_ERROR_SNIPPET_CHARS)
+        .collect();
+    if snippet.is_empty() {
+        format!("HTTP status {status}")
+    } else {
+        format!("HTTP status {status}: {snippet}")
+    }
 }
+
+const MAX_ERROR_SNIPPET_CHARS: usize = 300;
 
 impl HttpClient for UreqClient {
     fn get(&self, url: &str) -> Result<String, String> {
@@ -55,7 +77,7 @@ impl HttpClient for UreqClient {
             .read_to_string()
             .map_err(|e| format!("could not read response: {e}"))?;
         if !(200..300).contains(&status) {
-            return Err(describe(status));
+            return Err(describe(status, &text));
         }
         Ok(text)
     }
@@ -76,7 +98,7 @@ impl HttpClient for UreqClient {
             .read_to_string()
             .map_err(|e| format!("could not read response: {e}"))?;
         if !(200..300).contains(&status) {
-            return Err(describe(status));
+            return Err(describe(status, &text));
         }
         Ok(text)
     }
@@ -244,5 +266,35 @@ pub mod mock {
                 .unwrap_or_else(|| "1".to_string());
             Ok(format!(r#"{{"jsonrpc":"2.0","id":{id},{}"#, &inner[1..]))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_description_includes_a_short_clean_body() {
+        assert_eq!(describe(404, ""), "HTTP status 404");
+        assert_eq!(describe(404, "  \n"), "HTTP status 404");
+        assert_eq!(
+            describe(400, "{\"error\":\"bad\"}\n"),
+            "HTTP status 400: {\"error\":\"bad\"}"
+        );
+        let long = describe(500, &"x".repeat(1000));
+        assert_eq!(
+            long.chars().count(),
+            "HTTP status 500: ".len() + MAX_ERROR_SNIPPET_CHARS
+        );
+        assert!(!describe(500, "a\u{0}b\u{7}c").contains('\u{0}'));
+    }
+
+    #[test]
+    fn html_error_pages_are_summarised_not_echoed() {
+        let challenge = "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>";
+        let d = describe(403, challenge);
+        assert!(d.contains("Cloudflare") && !d.contains("DOCTYPE"));
+        let other = describe(502, "<html><body>Bad gateway</body></html>");
+        assert!(other.contains("web page") && !other.contains("Bad gateway"));
     }
 }

@@ -88,7 +88,11 @@ pub fn token_info(rpc: &RpcClient<'_>, address: &Address) -> Result<TokenInfo, S
     })
 }
 
-fn token_balance(rpc: &RpcClient<'_>, token: &Address, owner: &Address) -> Result<U256, String> {
+pub fn token_balance(
+    rpc: &RpcClient<'_>,
+    token: &Address,
+    owner: &Address,
+) -> Result<U256, String> {
     let data = rpc
         .eth_call(&CallRequest {
             to: Some(*token),

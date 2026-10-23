@@ -5,7 +5,7 @@ use crate::eth::explorer::{DEFAULT_LIMIT, HistoryKind};
 use crate::eth::networks::Network;
 use crate::json::Value;
 use crate::metadata;
-use crate::service::{IntentParams, WalletService};
+use crate::service::{IntentParams, SwapParams, WalletService};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -179,6 +179,69 @@ fn intent_from(a: &Args) -> Result<IntentParams, String> {
         asset: a.opt_str("asset")?.map(str::to_string),
         amount: a.opt_str("amount")?.map(str::to_string),
     })
+}
+
+fn swap_params(a: &Args, with_min_receive: bool) -> Result<SwapParams, String> {
+    Ok(SwapParams {
+        from_chain_id: a.u64("from_chain_id")?,
+        from_token: a.str("from_token")?.to_string(),
+        to_chain_id: a.u64("to_chain_id")?,
+        to_token: a.str("to_token")?.to_string(),
+        amount: a.str("amount")?.to_string(),
+        slippage_bps: a.opt_u64("slippage_bps")?,
+        to_address: a.opt_str("to_address")?.map(str::to_string),
+        min_receive: if with_min_receive {
+            a.opt_str("min_receive")?.map(str::to_string)
+        } else {
+            None
+        },
+    })
+}
+
+fn swap_inputs(with_min_receive: bool) -> Vec<Param> {
+    let mut p = vec![
+        wallet(),
+        password(),
+        req(
+            "from_chain_id",
+            Kind::Integer,
+            "Chain ID of the network the token you are selling is on. The wallet must have this network.",
+        ),
+        req(
+            "from_token",
+            Kind::Text,
+            "Contract address of the token to sell, or \"native\" for the network's coin.",
+        ),
+        req(
+            "to_chain_id",
+            Kind::Integer,
+            "Chain ID of the network to receive on. Must equal from_chain_id: OpenOcean only swaps within one chain, so cross-chain swaps are not supported.",
+        ),
+        req(
+            "to_token",
+            Kind::Text,
+            "Contract address of the token to receive, or \"native\".",
+        ),
+        req(
+            "amount",
+            Kind::Text,
+            "Amount of from_token to sell, in whole units, e.g. \"25.5\".",
+        ),
+        opt(
+            "slippage_bps",
+            Kind::Integer,
+            "Maximum price slippage in basis points (100 = 1%), 5 to 1000. Default 100 (1%).",
+        ),
+        opt(
+            "to_address",
+            Kind::Text,
+            "Send the bought tokens to this address on the same chain instead of to the wallet itself.",
+        ),
+    ];
+    if with_min_receive {
+        p.push(opt("min_receive", Kind::Text, "Safety floor in whole units of to_token. If the fresh quote's guaranteed minimum is lower, nothing is swapped. Use the minimum_amount from get_swap_quote."));
+    }
+    p
 }
 
 fn network_from(a: &Args) -> Result<Network, String> {
@@ -551,6 +614,30 @@ fn definitions() -> Vec<Tool> {
             },
         },
         Tool {
+            name: "get_swap_quote",
+            description: "Preview a swap before doing it, with nothing signed or sent: how much of the new token you would get (expected and guaranteed minimum), the fees (service fee of 0.7% of the amount sold, estimated network fee), the route, price impact, and whether an approval or more balance is needed. Powered by OpenOcean; needs no API key. Swaps work within one chain only (OpenOcean does not offer cross-chain swaps), so to_chain_id must equal from_chain_id.",
+            params: swap_inputs(false),
+            handler: |s, a| {
+                s.get_swap_quote(
+                    a.str("wallet_name")?,
+                    a.str("password")?,
+                    &swap_params(a, false)?,
+                )
+            },
+        },
+        Tool {
+            name: "swap_tokens",
+            description: "Swap one token for another on one chain through OpenOcean and broadcast it. Irreversible. Call get_swap_quote first and pass its minimum_amount as min_receive. If the sold token needs an approval, exactly the sold amount is approved first (and confirmed) before the swap is sent. Returns the transaction hash. Cross-chain swaps are not supported.",
+            params: swap_inputs(true),
+            handler: |s, a| {
+                s.swap_tokens(
+                    a.str("wallet_name")?,
+                    a.str("password")?,
+                    &swap_params(a, true)?,
+                )
+            },
+        },
+        Tool {
             name: "add_token",
             description: "Add an ERC-20 token to a wallet on a network, by contract address, so it always appears in get_wallet_balances (even at zero). The contract is checked on-chain (decimals and symbol are read from it). Stored inside the wallet's encrypted vault; up to 50 added tokens per network.",
             params: vec![
@@ -849,6 +936,8 @@ mod tests {
             "list_networks",
             "add_token",
             "remove_token",
+            "get_swap_quote",
+            "swap_tokens",
             "view_seed_phrase",
             "view_private_key",
             "export_wallet",
@@ -1137,6 +1226,95 @@ mod tests {
             r#"{"wallet_name":"w","password":"wrong-password","chain_id":1,"contract":"0x2222222222222222222222222222222222222222"}"#,
         );
         assert!(err && msg.as_str().unwrap().contains("incorrect password"));
+    }
+
+    #[test]
+    fn swap_tools_expose_the_requested_parameters() {
+        let (_f, tb) = toolbox_fixture();
+        let find = |name: &str| tb.tools.iter().find(|t| t.name == name).unwrap();
+        for name in ["get_swap_quote", "swap_tokens"] {
+            let tool = find(name);
+            for required in [
+                "wallet_name",
+                "password",
+                "from_chain_id",
+                "from_token",
+                "to_chain_id",
+                "to_token",
+                "amount",
+            ] {
+                assert!(
+                    tool.params.iter().any(|p| p.name == required && p.required),
+                    "{name} must require {required}"
+                );
+            }
+            for optional in ["slippage_bps", "to_address"] {
+                assert!(
+                    tool.params
+                        .iter()
+                        .any(|p| p.name == optional && !p.required),
+                    "{name} {optional}"
+                );
+            }
+            // no API keys, secrets or provider settings are ever accepted from the caller
+            assert!(
+                !tool
+                    .params
+                    .iter()
+                    .any(|p| p.name.contains("key") || p.name.contains("secret"))
+            );
+            assert!(
+                !tool
+                    .params
+                    .iter()
+                    .any(|p| p.name.contains("fee") || p.name.contains("referrer"))
+            );
+        }
+        assert!(
+            !find("get_swap_quote")
+                .params
+                .iter()
+                .any(|p| p.name == "min_receive")
+        );
+        assert!(
+            find("swap_tokens")
+                .params
+                .iter()
+                .any(|p| p.name == "min_receive" && !p.required)
+        );
+    }
+
+    #[test]
+    fn swap_tools_explain_unsupported_requests() {
+        let (_f, tb) = toolbox_fixture();
+        call(
+            &tb,
+            "create_wallet",
+            r#"{"blockchain":"ethereum","wallet_name":"w","password":"long-enough-pw"}"#,
+        );
+        for tool in ["get_swap_quote", "swap_tokens"] {
+            let (err, msg) = call(
+                &tb,
+                tool,
+                r#"{"wallet_name":"w","password":"long-enough-pw","from_chain_id":1,"from_token":"native","to_chain_id":8453,"to_token":"native","amount":"1"}"#,
+            );
+            assert!(
+                err && msg.as_str().unwrap().contains("cross-chain"),
+                "{tool}"
+            );
+        }
+        let (err, msg) = call(
+            &tb,
+            "get_swap_quote",
+            r#"{"wallet_name":"w","password":"long-enough-pw","from_chain_id":1,"from_token":"native","to_chain_id":1,"to_token":"native"}"#,
+        );
+        assert!(err && msg.as_str().unwrap().contains("'amount'"));
+        let (err, _) = call(
+            &tb,
+            "get_swap_quote",
+            r#"{"wallet_name":"w","password":"long-enough-pw","from_chain_id":"x","from_token":"native","to_chain_id":1,"to_token":"native","amount":"1"}"#,
+        );
+        assert!(err);
     }
 
     #[test]

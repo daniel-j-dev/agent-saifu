@@ -8,6 +8,7 @@ pub mod ops;
 pub mod prices;
 pub mod rlp;
 pub mod rpc;
+pub mod swap;
 pub mod tokens;
 pub mod tx;
 pub mod u256;

@@ -9,10 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::blockchain::Blockchain;
 use crate::crypto::{hex, sha2::sha256};
+use crate::eth::abi;
 use crate::eth::address::{Address, parse_address, to_checksum};
 use crate::eth::explorer::{self, HistoryKind};
 use crate::eth::networks::{self, Network};
 use crate::eth::ops::{self, TxIntent, num};
+use crate::eth::rpc::{CallRequest, RpcClient};
+use crate::eth::swap::{self, ChainState, Expectation, Quote, Side, SwapRequest, SwapSettings};
 use crate::eth::tokens::{self, CustomToken};
 use crate::eth::u256::U256;
 use crate::eth::wallet::{VaultContents, validate_export_key, validate_password};
@@ -77,6 +80,32 @@ pub struct WalletService {
     http: Rc<dyn HttpClient>,
     limiter: RefCell<AttemptLimiter>,
     iterations: u32,
+    swap: SwapSettings,
+    /// Pause between receipt checks and how many checks to make when waiting on an approval.
+    receipt_wait: (Duration, u32),
+}
+
+/// Input shared by `get_swap_quote` and `swap_tokens`.
+#[derive(Debug, Clone, Default)]
+pub struct SwapParams {
+    pub from_chain_id: u64,
+    pub from_token: String,
+    pub to_chain_id: u64,
+    pub to_token: String,
+    pub amount: String,
+    pub slippage_bps: Option<u64>,
+    /// Receive the bought tokens at another address on the same chain.
+    pub to_address: Option<String>,
+    pub min_receive: Option<String>,
+}
+
+struct PreparedSwap {
+    owner: Address,
+    receiver: Address,
+    from: Side,
+    to: Side,
+    request: SwapRequest,
+    expect: Expectation,
 }
 
 fn merge(base: Value, extra: Vec<(&str, Value)>) -> Value {
@@ -160,7 +189,19 @@ impl WalletService {
             http,
             limiter: RefCell::new(AttemptLimiter::default()),
             iterations: vault::DEFAULT_ITERATIONS,
+            swap: SwapSettings::default(),
+            receipt_wait: (Duration::from_secs(3), 60),
         }
+    }
+
+    pub fn with_swap_settings(mut self, settings: SwapSettings) -> WalletService {
+        self.swap = settings;
+        self
+    }
+
+    pub fn with_receipt_wait(mut self, pause: Duration, attempts: u32) -> WalletService {
+        self.receipt_wait = (pause, attempts);
+        self
     }
 
     /// Lower PBKDF2 cost; only meant for tests.
@@ -819,6 +860,358 @@ impl WalletService {
     }
 }
 
+// ---- swaps (OpenOcean) ----------------------------------------------------------
+
+fn without_key(value: Value, key: &str) -> Value {
+    match value {
+        Value::Object(mut pairs) => {
+            pairs.retain(|(k, _)| k != key);
+            Value::Object(pairs)
+        }
+        other => other,
+    }
+}
+
+impl WalletService {
+    fn resolve_side(
+        &self,
+        rpc: &RpcClient<'_>,
+        network: &Network,
+        token: &str,
+    ) -> Result<Side, String> {
+        let native = || Side {
+            network: network.clone(),
+            token: swap::native_token_address(network.chain_id),
+            native: true,
+            symbol: network.currency_symbol.clone(),
+            decimals: ops::NATIVE_DECIMALS,
+        };
+        if ops::is_native(token) {
+            return Ok(native());
+        }
+        let address = parse_address(token).map_err(|e| {
+            format!(
+                "token '{}': {e}",
+                crate::eth::explorer::sanitize_text(token)
+            )
+        })?;
+        if swap::is_native_address(network.chain_id, &address) {
+            return Ok(native());
+        }
+        let info = ops::token_info(rpc, &address)?;
+        Ok(Side {
+            network: network.clone(),
+            token: address,
+            native: false,
+            symbol: info.symbol,
+            decimals: info.decimals,
+        })
+    }
+
+    fn prepare_swap(
+        &self,
+        rpc: &RpcClient<'_>,
+        network: &Network,
+        owner: Address,
+        p: &SwapParams,
+    ) -> Result<PreparedSwap, String> {
+        let slippage_bps = match p.slippage_bps {
+            None => None,
+            Some(s)
+                if (u64::from(swap::MIN_SLIPPAGE_BPS)..=u64::from(swap::MAX_SLIPPAGE_BPS))
+                    .contains(&s) =>
+            {
+                Some(s as u32)
+            }
+            Some(_) => {
+                return Err(format!(
+                    "slippage_bps must be between {} and {} (0.05% to 10%)",
+                    swap::MIN_SLIPPAGE_BPS,
+                    swap::MAX_SLIPPAGE_BPS
+                ));
+            }
+        };
+        let receiver = match &p.to_address {
+            Some(a) => {
+                let addr = parse_address(a).map_err(|e| format!("'to_address': {e}"))?;
+                if addr.iter().all(|b| *b == 0) {
+                    return Err(
+                        "'to_address' must not be the zero address (tokens would be burned)"
+                            .to_string(),
+                    );
+                }
+                addr
+            }
+            None => owner,
+        };
+        let from = self.resolve_side(rpc, network, &p.from_token)?;
+        let to = self.resolve_side(rpc, network, &p.to_token)?;
+        if from.token == to.token {
+            return Err("from_token and to_token are the same token".to_string());
+        }
+        let amount =
+            U256::parse_units(&p.amount, from.decimals).map_err(|e| format!("'amount': {e}"))?;
+        if amount.is_zero() {
+            return Err("amount must be greater than zero".to_string());
+        }
+        let min_receive = match &p.min_receive {
+            Some(m) => {
+                Some(U256::parse_units(m, to.decimals).map_err(|e| format!("'min_receive': {e}"))?)
+            }
+            None => None,
+        };
+        let gas_price = rpc
+            .gas_price()
+            .map_err(|e| format!("cannot read the gas price: {e}"))?;
+        Ok(PreparedSwap {
+            owner,
+            receiver,
+            request: SwapRequest {
+                chain_id: network.chain_id,
+                in_token: from.token,
+                out_token: to.token,
+                amount,
+                gas_price,
+                // The API insists on a slippage value, so the default is always sent.
+                slippage_bps: Some(slippage_bps.unwrap_or(swap::DEFAULT_SLIPPAGE_BPS)),
+                sender: owner,
+                receiver,
+            },
+            expect: Expectation {
+                chain_id: network.chain_id,
+                in_token: from.token,
+                in_native: from.native,
+                in_decimals: from.decimals,
+                out_token: to.token,
+                out_native: to.native,
+                out_decimals: to.decimals,
+                requested: amount,
+                sender: owner,
+                min_receive,
+            },
+            from,
+            to,
+        })
+    }
+
+    /// Validates the chain choice and returns the network to swap on.
+    fn swap_network(contents: &VaultContents, p: &SwapParams) -> Result<Network, String> {
+        if p.from_chain_id != p.to_chain_id {
+            return Err(format!(
+                "cross-chain swaps are not supported: OpenOcean's API only swaps within one chain (from chain {} to chain {} was requested). Swap on the origin chain into the token you want instead",
+                p.from_chain_id, p.to_chain_id
+            ));
+        }
+        if !swap::is_supported_chain(p.from_chain_id) {
+            return Err(format!(
+                "OpenOcean does not support chain ID {}",
+                p.from_chain_id
+            ));
+        }
+        Self::network_of(contents, p.from_chain_id)
+    }
+
+    fn read_state(&self, rpc: &RpcClient<'_>, prep: &PreparedSwap) -> Result<ChainState, String> {
+        if prep.from.native {
+            let balance = rpc
+                .balance(&prep.owner)
+                .map_err(|e| format!("cannot read balance: {e}"))?;
+            return Ok(ChainState {
+                balance,
+                allowance: None,
+            });
+        }
+        let balance = ops::token_balance(rpc, &prep.from.token, &prep.owner)
+            .map_err(|e| format!("cannot read the {} balance: {e}", prep.from.symbol))?;
+        let router = swap::router_for_chain(prep.request.chain_id);
+        let data = rpc
+            .eth_call(&CallRequest {
+                to: Some(prep.from.token),
+                data: abi::erc20_allowance(&prep.owner, &router),
+                ..Default::default()
+            })
+            .map_err(|e| format!("cannot read the allowance: {e}"))?;
+        Ok(ChainState {
+            balance,
+            allowance: Some(abi::decode_uint256(&data)?),
+        })
+    }
+
+    fn fetch_quote(&self, prep: &PreparedSwap) -> Result<Quote, String> {
+        let url = swap::swap_url(&self.swap.base_url, &prep.request, self.swap.fee.as_ref());
+        swap::parse_swap(&swap::fetch(&*self.http, &url)?)
+    }
+
+    fn require_balance(prep: &PreparedSwap, state: &ChainState) -> Result<(), String> {
+        if state.balance < prep.request.amount {
+            return Err(format!(
+                "insufficient {} balance: the wallet holds {} but the swap needs {}",
+                prep.from.symbol,
+                state.balance.format_units(prep.from.decimals),
+                prep.request.amount.format_units(prep.from.decimals)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns what a swap would give: expected and minimum amounts and the fees.
+    pub fn get_swap_quote(
+        &self,
+        name: &str,
+        password: &str,
+        p: &SwapParams,
+    ) -> Result<Value, String> {
+        let (record, contents) = self.unlock(name, password)?;
+        let network = Self::swap_network(&contents, p)?;
+        let rpc = ops::connect(&*self.http, &network)?;
+        let prep = self.prepare_swap(&rpc, &network, contents.address()?, p)?;
+        let state = self.read_state(&rpc, &prep)?;
+        let quote = self.fetch_quote(&prep)?;
+        let report = swap::quote_report(
+            &prep.from,
+            &prep.to,
+            &quote,
+            self.swap.fee.as_ref(),
+            &prep.request.amount,
+            &prep.receiver,
+            &prep.request.gas_price,
+            &state,
+        );
+        Ok(merge(report, vec![("wallet", Value::String(record.name))]))
+    }
+
+    fn wait_for_success(&self, rpc: &RpcClient<'_>, hash: &[u8; 32]) -> Result<(), String> {
+        let (pause, attempts) = self.receipt_wait;
+        for attempt in 0..attempts {
+            if let Ok(Some(receipt)) = rpc.transaction_receipt(hash) {
+                return match receipt.get("status").and_then(Value::as_str) {
+                    Some("0x1") => Ok(()),
+                    _ => Err(
+                        "the approval transaction failed on-chain; the swap was not sent"
+                            .to_string(),
+                    ),
+                };
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(pause);
+            }
+        }
+        Err(format!(
+            "the approval {} was not confirmed in time; the swap was NOT sent. Check it with get_transaction, then try again",
+            hex::encode_prefixed(hash)
+        ))
+    }
+
+    /// Approves exactly `amount` (never unlimited); resets a non-zero allowance first,
+    /// because some tokens (e.g. USDT) refuse to change one non-zero allowance to another.
+    fn approve_exact(
+        &self,
+        rpc: &RpcClient<'_>,
+        prep: &PreparedSwap,
+        key: &[u8; 32],
+        current: &U256,
+    ) -> Result<Vec<Value>, String> {
+        let spender = swap::router_for_chain(prep.request.chain_id);
+        let mut steps = vec![];
+        if !current.is_zero() {
+            steps.push(("reset_allowance", U256::ZERO));
+        }
+        steps.push(("approve", prep.request.amount));
+        let mut done = vec![];
+        for (purpose, value) in steps {
+            let intent = TxIntent {
+                to: prep.from.token,
+                value: U256::ZERO,
+                data: abi::erc20_approve(&spender, &value),
+            };
+            let network = &prep.from.network;
+            let prepared = ops::prepare_tx(rpc, network, &prep.owner, &intent, None)
+                .map_err(|e| format!("approval failed: {e}"))?;
+            let sent = ops::sign_and_maybe_send(rpc, network, &prepared, key, true)
+                .map_err(|e| format!("approval failed: {e}"))?;
+            let hash_text = sent
+                .get("transaction_hash")
+                .and_then(Value::as_str)
+                .ok_or("approval returned no transaction hash")?
+                .to_string();
+            self.wait_for_success(rpc, &parse_hash(&hash_text)?)?;
+            done.push(Value::object(vec![
+                ("purpose", Value::str(purpose)),
+                ("spender", Value::String(to_checksum(&spender))),
+                ("amount_raw", Value::String(value.to_dec_string())),
+                ("transaction_hash", Value::String(hash_text)),
+            ]));
+        }
+        Ok(done)
+    }
+
+    /// Swaps tokens on one chain through OpenOcean and broadcasts the transaction.
+    pub fn swap_tokens(&self, name: &str, password: &str, p: &SwapParams) -> Result<Value, String> {
+        let (record, contents) = self.unlock(name, password)?;
+        let network = Self::swap_network(&contents, p)?;
+        let rpc = ops::connect(&*self.http, &network)?;
+        let prep = self.prepare_swap(&rpc, &network, contents.address()?, p)?;
+        let key = contents.private_key_array()?;
+
+        let mut state = self.read_state(&rpc, &prep)?;
+        Self::require_balance(&prep, &state)?;
+        let mut quote = self.fetch_quote(&prep)?;
+        swap::check_quote(&quote, &prep.expect)?;
+
+        let mut approvals = vec![];
+        if let Some(allowance) = state.allowance
+            && allowance < prep.request.amount
+        {
+            approvals = self.approve_exact(&rpc, &prep, &key.0, &allowance)?;
+            // Price the swap again now that the approval is in place.
+            quote = self.fetch_quote(&prep)?;
+            state = self.read_state(&rpc, &prep)?;
+            Self::require_balance(&prep, &state)?;
+        }
+        let tx = swap::check_quote(&quote, &prep.expect)?.clone();
+
+        let intent = TxIntent {
+            to: tx.to,
+            value: tx.value,
+            data: tx.data,
+        };
+        let mut prepared = ops::prepare_tx(&rpc, &network, &prep.owner, &intent, None)?;
+        // OpenOcean advises 1.25x to 2.5x of the estimate for aggregator swaps.
+        let roomy = prepared.gas_estimate.saturating_mul(3) / 2;
+        prepared.tx.gas_limit = prepared.tx.gas_limit.max(roomy);
+        let sent = ops::sign_and_maybe_send(&rpc, &network, &prepared, &key.0, true)?;
+
+        let report = without_key(
+            swap::quote_report(
+                &prep.from,
+                &prep.to,
+                &quote,
+                self.swap.fee.as_ref(),
+                &prep.request.amount,
+                &prep.receiver,
+                &prep.request.gas_price,
+                &state,
+            ),
+            "note",
+        );
+        Ok(merge(
+            report,
+            vec![
+                ("wallet", Value::String(record.name)),
+                ("status", Value::str("submitted")),
+                ("transaction", sent),
+                ("approvals", Value::Array(approvals)),
+                (
+                    "next_step",
+                    Value::str(
+                        "Confirm the swap with get_transaction (chain_id, transaction_hash).",
+                    ),
+                ),
+            ],
+        ))
+    }
+}
+
 #[cfg(test)]
 pub mod testing {
     use super::*;
@@ -852,11 +1245,22 @@ pub mod testing {
     }
 
     pub fn fixture_with(router: RouterMock) -> Fixture {
+        fixture_custom(router, |s| s)
+    }
+
+    /// Like `fixture_with`, letting the test configure the service (e.g. swap settings).
+    pub fn fixture_custom(
+        router: RouterMock,
+        configure: impl FnOnce(WalletService) -> WalletService,
+    ) -> Fixture {
         let dir = TempDir::new();
         let router = Rc::new(router);
         let http: Rc<dyn HttpClient> = router.clone();
-        let service = WalletService::new(Store::open(&dir.0).unwrap(), http)
-            .with_iterations(vault::MIN_ITERATIONS);
+        let service = configure(
+            WalletService::new(Store::open(&dir.0).unwrap(), http)
+                .with_iterations(vault::MIN_ITERATIONS)
+                .with_receipt_wait(Duration::ZERO, 3),
+        );
         Fixture {
             dir,
             router,
@@ -2039,5 +2443,655 @@ mod tests {
             "reads must not rewrite the vault"
         );
         assert!(!before.contains("mnemonic") && !before.contains("keyrings"));
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::testing::*;
+    use super::*;
+    use crate::eth::swap::SwapFee;
+    use crate::http::mock::RouterMock;
+
+    const RECIPIENT: &str = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+    const ROUTER: &str = "0x6352a56caadc4f1e25cd6c75970fa768a3304e64";
+    const OO_SWAP: &str = "open-api.de1.exchange/v4/1/swap";
+    /// The address of private key 0x...01, which `setup` imports.
+    const WALLET: &str = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+
+    fn usdc() -> String {
+        to_checksum(&[0xa0; 20])
+    }
+
+    fn usdc_lower() -> String {
+        hex::encode_prefixed(&[0xa0; 20])
+    }
+
+    fn string_result(s: &str) -> String {
+        format!(
+            "\"0x{}\"",
+            hex::encode(&abi::encode_values(&[abi::AbiValue::Str(s.into())]))
+        )
+    }
+
+    /// Mainnet node: 6-decimal "USDC" at 0xa0a0..., 1 ETH, 100 USDC, no allowance.
+    fn mainnet() -> RouterMock {
+        RouterMock::new()
+            .rpc("eth_chainId", "\"0x1\"")
+            .rpc("eth_getBalance", "\"0xde0b6b3a7640000\"")
+            .rpc("eth_getTransactionCount", "\"0x5\"")
+            .rpc(
+                "eth_getBlockByNumber",
+                r#"{"baseFeePerGas":"0x3b9aca00","timestamp":"0x65"}"#,
+            )
+            .rpc("eth_maxPriorityFeePerGas", "\"0x3b9aca00\"")
+            .rpc("eth_gasPrice", "\"0x3b9aca00\"")
+            .rpc("eth_estimateGas", "\"0x30d40\"")
+            .rpc("eth_blockNumber", "\"0x70\"")
+            .rpc("eth_call:313ce567", &word(6))
+            .rpc("eth_call:95d89b41", &string_result("USDC"))
+            .rpc("eth_call:70a08231", &word(100_000_000))
+            .rpc("eth_call:dd62ed3e", &word(0))
+            .rpc(
+                "eth_sendRawTransaction",
+                &format!("\"0x{}\"", "cd".repeat(32)),
+            )
+            .rpc(
+                "eth_getTransactionReceipt",
+                r#"{"status":"0x1","blockNumber":"0x64"}"#,
+            )
+    }
+
+    /// An OpenOcean `/swap` response (selling 25 USDC for ETH by default).
+    struct Oo {
+        in_addr: String,
+        in_decimals: u32,
+        out_addr: String,
+        out_decimals: u32,
+        in_amount: String,
+        out_amount: String,
+        min_out: String,
+        to: String,
+        value: String,
+        impact: String,
+    }
+
+    impl Oo {
+        fn usdc_to_eth() -> Oo {
+            Oo {
+                in_addr: usdc_lower(),
+                in_decimals: 6,
+                out_addr: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+                out_decimals: 18,
+                in_amount: "25000000".into(),
+                out_amount: "10300000000000000".into(),
+                min_out: "10200000000000000".into(),
+                to: ROUTER.into(),
+                value: "0".into(),
+                impact: "-0.05%".into(),
+            }
+        }
+
+        fn eth_to_usdc() -> Oo {
+            Oo {
+                in_addr: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+                in_decimals: 18,
+                out_addr: usdc_lower(),
+                out_decimals: 6,
+                in_amount: "10000000000000000".into(),
+                out_amount: "24000000".into(),
+                min_out: "23700000".into(),
+                to: ROUTER.into(),
+                value: "10000000000000000".into(),
+                impact: "-0.10%".into(),
+            }
+        }
+
+        fn json(&self) -> String {
+            format!(
+                r#"{{"code":200,"data":{{"inToken":{{"address":"{}","decimals":{},"symbol":"IN","usd":"1","volume":25}},"outToken":{{"address":"{}","decimals":{},"symbol":"OUT","usd":"1","volume":24.8}},"inAmount":"{}","outAmount":"{}","estimatedGas":174014,"minOutAmount":"{}","from":"{WALLET}","to":"{}","value":"{}","gasPrice":"1000000000","data":"0x90411a32","chainId":1,"price_impact":"{}","path":{{"routes":[{{"subRoutes":[{{"dexes":[{{"dex":"UniswapV4"}}]}}]}}]}}}}}}"#,
+                self.in_addr,
+                self.in_decimals,
+                self.out_addr,
+                self.out_decimals,
+                self.in_amount,
+                self.out_amount,
+                self.min_out,
+                self.to,
+                self.value,
+                self.impact
+            )
+        }
+    }
+
+    fn settings(with_fee: bool) -> SwapSettings {
+        SwapSettings::new(if with_fee {
+            SwapFee::from_parts(RECIPIENT, 70).unwrap()
+        } else {
+            None
+        })
+    }
+
+    fn params() -> SwapParams {
+        SwapParams {
+            from_chain_id: 1,
+            from_token: usdc(),
+            to_chain_id: 1,
+            to_token: "native".to_string(),
+            amount: "25".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn setup_with(router: RouterMock, with_fee: bool) -> Fixture {
+        let f = fixture_custom(router, |s| s.with_swap_settings(settings(with_fee)));
+        let key = format!("0x{}01", "00".repeat(31));
+        f.service
+            .import_wallet("ethereum", "w", PW, None, Some(&key))
+            .unwrap();
+        f
+    }
+
+    fn setup(oo: &Oo, with_fee: bool) -> Fixture {
+        setup_with(mainnet().get(OO_SWAP, Ok(oo.json())), with_fee)
+    }
+
+    fn sends(f: &Fixture) -> usize {
+        f.router
+            .sent_methods()
+            .iter()
+            .filter(|m| *m == "eth_sendRawTransaction")
+            .count()
+    }
+
+    fn oo_requests(f: &Fixture) -> Vec<String> {
+        f.router
+            .sent_methods()
+            .into_iter()
+            .filter(|m| m.starts_with("GET https://open-api.de1.exchange"))
+            .collect()
+    }
+
+    fn text<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
+        let mut cur = v;
+        for p in path {
+            cur = cur.get(p)?;
+        }
+        cur.as_str()
+    }
+
+    // ---- quotes ----
+
+    #[test]
+    fn quote_shows_expected_amount_and_fees_and_sends_nothing() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let q = f.service.get_swap_quote("w", PW, &params()).unwrap();
+        assert_eq!(text(&q, &["type"]), Some("same_chain"));
+        assert_eq!(text(&q, &["wallet"]), Some("w"));
+        assert_eq!(text(&q, &["from", "amount"]), Some("25"));
+        assert_eq!(text(&q, &["from", "symbol"]), Some("USDC"));
+        assert_eq!(text(&q, &["to", "expected_amount"]), Some("0.0103"));
+        assert_eq!(text(&q, &["to", "minimum_amount"]), Some("0.0102"));
+        assert_eq!(text(&q, &["to", "symbol"]), Some("ETH"));
+        assert_eq!(
+            text(&q, &["to", "recipient"]),
+            Some("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf")
+        );
+        assert_eq!(text(&q, &["fees", "service_fee", "percent"]), Some("0.7"));
+        assert_eq!(text(&q, &["fees", "service_fee", "amount"]), Some("0.175"));
+        assert_eq!(
+            text(&q, &["fees", "service_fee", "recipient"]),
+            Some(RECIPIENT)
+        );
+        assert_eq!(text(&q, &["fees", "network_fee", "currency"]), Some("ETH"));
+        let req = q.get("requirements").unwrap();
+        assert_eq!(req.get("approval_needed"), Some(&Value::Bool(true)));
+        assert_eq!(req.get("sufficient_balance"), Some(&Value::Bool(true)));
+        assert_eq!(sends(&f), 0);
+    }
+
+    #[test]
+    fn quote_request_carries_the_fee_and_needs_no_key_or_headers() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        f.service.get_swap_quote("w", PW, &params()).unwrap();
+        let requests = oo_requests(&f);
+        assert_eq!(requests.len(), 1);
+        let url = &requests[0];
+        assert!(url.contains("/v4/1/swap?inTokenAddress=0xa0a0"));
+        assert!(url.contains("outTokenAddress=0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"));
+        assert!(url.contains("amountDecimals=25000000"));
+        assert!(url.contains("gasPriceDecimals=1000000000"));
+        assert!(url.contains(&format!("account={WALLET}")));
+        assert!(url.contains("referrer=0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed"));
+        assert!(url.contains("referrerFee=0.7"));
+        assert!(!url.to_lowercase().contains("apikey") && !url.contains("sender="));
+    }
+
+    #[test]
+    fn without_a_fee_recipient_no_fee_is_requested() {
+        let f = setup(&Oo::usdc_to_eth(), false);
+        let q = f.service.get_swap_quote("w", PW, &params()).unwrap();
+        assert!(!oo_requests(&f)[0].contains("referrer"));
+        assert_eq!(
+            q.get("fees").unwrap().get("service_fee"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn selling_the_native_coin_and_erc20_to_erc20() {
+        let f = setup(&Oo::eth_to_usdc(), true);
+        let mut p = params();
+        p.from_token = "native".into();
+        p.to_token = usdc();
+        p.amount = "0.01".into();
+        let q = f.service.get_swap_quote("w", PW, &p).unwrap();
+        assert_eq!(text(&q, &["from", "symbol"]), Some("ETH"));
+        assert_eq!(text(&q, &["to", "symbol"]), Some("USDC"));
+        assert_eq!(text(&q, &["to", "expected_amount"]), Some("24"));
+        assert_eq!(
+            q.get("requirements").unwrap().get("approval_needed"),
+            Some(&Value::Bool(false))
+        );
+        assert!(oo_requests(&f)[0].contains("inTokenAddress=0xeeee"));
+        // ERC-20 to ERC-20: both sides read their decimals from the chain
+        let mut oo = Oo::usdc_to_eth();
+        oo.out_addr = hex::encode_prefixed(&[0xb0; 20]);
+        oo.out_decimals = 6;
+        oo.out_amount = "24900000".into();
+        oo.min_out = "24600000".into();
+        let g = setup(&oo, true);
+        let mut p = params();
+        p.to_token = to_checksum(&[0xb0; 20]);
+        let q = g.service.get_swap_quote("w", PW, &p).unwrap();
+        assert_eq!(text(&q, &["to", "expected_amount"]), Some("24.9"));
+    }
+
+    #[test]
+    fn a_different_receiver_is_sent_as_account_with_the_wallet_as_sender() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let mut p = params();
+        p.to_address = Some(to_checksum(&[0x22; 20]));
+        let q = f.service.get_swap_quote("w", PW, &p).unwrap();
+        let url = &oo_requests(&f)[0];
+        assert!(url.contains("account=0x2222222222222222222222222222222222222222"));
+        assert!(url.contains(&format!("sender={WALLET}")));
+        assert_eq!(
+            text(&q, &["to", "recipient"]),
+            Some(to_checksum(&[0x22; 20]).as_str())
+        );
+        p.to_address = Some("nope".into());
+        assert!(
+            f.service
+                .get_swap_quote("w", PW, &p)
+                .unwrap_err()
+                .contains("'to_address'")
+        );
+        p.to_address = Some(to_checksum(&[0; 20]));
+        assert!(
+            f.service
+                .get_swap_quote("w", PW, &p)
+                .unwrap_err()
+                .contains("zero address")
+        );
+    }
+
+    #[test]
+    fn slippage_is_always_sent_defaulting_to_one_percent() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        f.service.get_swap_quote("w", PW, &params()).unwrap();
+        assert!(
+            oo_requests(&f)[0].contains("slippage=1&")
+                || oo_requests(&f)[0].ends_with("slippage=1")
+        );
+    }
+
+    #[test]
+    fn slippage_is_passed_as_a_percentage() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let mut p = params();
+        p.slippage_bps = Some(50);
+        f.service.get_swap_quote("w", PW, &p).unwrap();
+        assert!(oo_requests(&f)[0].contains("slippage=0.5"));
+    }
+
+    #[test]
+    fn quote_reports_but_does_not_fail_on_low_balance() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let mut p = params();
+        p.amount = "250".into();
+        let q = f.service.get_swap_quote("w", PW, &p).unwrap();
+        assert_eq!(
+            q.get("requirements").unwrap().get("sufficient_balance"),
+            Some(&Value::Bool(false))
+        );
+        assert!(
+            !q.get("warnings")
+                .and_then(Value::as_array)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unsupported_requests_are_explained_before_any_api_call() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let bad = |mutate: fn(&mut SwapParams)| {
+            let mut p = params();
+            mutate(&mut p);
+            f.service.get_swap_quote("w", PW, &p).unwrap_err()
+        };
+        assert!(bad(|p| p.to_chain_id = 8453).contains("cross-chain swaps are not supported"));
+        assert!(
+            bad(|p| {
+                p.from_chain_id = 999_999;
+                p.to_chain_id = 999_999
+            })
+            .contains("does not support chain ID")
+        );
+        assert!(
+            bad(|p| {
+                p.from_chain_id = 56;
+                p.to_chain_id = 56
+            })
+            .contains("add_network")
+        );
+        assert!(bad(|p| p.to_token = p.from_token.clone()).contains("same token"));
+        assert!(
+            bad(|p| {
+                p.from_token = "native".into();
+                p.to_token = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".into()
+            })
+            .contains("same token")
+        );
+        assert!(bad(|p| p.amount = "0".into()).contains("greater than zero"));
+        assert!(bad(|p| p.amount = "abc".into()).contains("'amount'"));
+        assert!(bad(|p| p.amount = "0.0000001".into()).contains("'amount'"));
+        assert!(bad(|p| p.slippage_bps = Some(4)).contains("slippage_bps"));
+        assert!(bad(|p| p.slippage_bps = Some(1001)).contains("slippage_bps"));
+        assert!(bad(|p| p.from_token = "nope".into()).contains("token"));
+        assert!(bad(|p| p.min_receive = Some("x".into())).contains("'min_receive'"));
+        assert!(
+            f.service
+                .get_swap_quote("w", "wrong-password", &params())
+                .unwrap_err()
+                .contains("incorrect password")
+        );
+        assert!(oo_requests(&f).is_empty());
+    }
+
+    #[test]
+    fn api_failures_are_readable() {
+        for (err, expect) in [
+            (
+                "HTTP status 403 (blocked by Cloudflare bot protection)",
+                "bot protection",
+            ),
+            ("HTTP status 429", "2 requests per second"),
+            ("HTTP status 500: boom", "boom"),
+        ] {
+            let f = setup_with(mainnet().get(OO_SWAP, Err(err.into())), true);
+            let e = f.service.get_swap_quote("w", PW, &params()).unwrap_err();
+            assert!(e.contains(expect), "{e}");
+            assert_eq!(sends(&f), 0);
+        }
+        let f = setup_with(
+            mainnet().get(
+                OO_SWAP,
+                Ok(r#"{"code":400,"error":"INSUFFICIENT_LIQUIDITY"}"#.into()),
+            ),
+            true,
+        );
+        assert!(
+            f.service
+                .get_swap_quote("w", PW, &params())
+                .unwrap_err()
+                .contains("INSUFFICIENT_LIQUIDITY")
+        );
+    }
+
+    // ---- swapping ----
+
+    #[test]
+    fn swapping_approves_exactly_the_sold_amount_then_swaps() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let mut p = params();
+        p.min_receive = Some("0.0102".into());
+        let out = f.service.swap_tokens("w", PW, &p).unwrap();
+        assert_eq!(text(&out, &["status"]), Some("submitted"));
+        assert_eq!(sends(&f), 2, "one approval + one swap");
+        let approvals = out.get("approvals").and_then(Value::as_array).unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(text(&approvals[0], &["purpose"]), Some("approve"));
+        assert_eq!(text(&approvals[0], &["amount_raw"]), Some("25000000"));
+        assert_eq!(
+            text(&approvals[0], &["spender"]),
+            Some("0x6352a56caadC4F1E25CD6c75970Fa768A3304e64")
+        );
+        assert_eq!(
+            out.get("transaction").unwrap().get("broadcast"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(text(&out, &["to", "expected_amount"]), Some("0.0103"));
+        assert_eq!(text(&out, &["fees", "service_fee", "percent"]), Some("0.7"));
+        assert!(out.get("note").is_none());
+        assert!(
+            text(&out, &["next_step"])
+                .unwrap()
+                .contains("get_transaction")
+        );
+        assert_eq!(oo_requests(&f).len(), 2, "fresh quote after approving");
+    }
+
+    #[test]
+    fn existing_allowances_are_reset_topped_up_or_reused() {
+        // non-zero but too small: reset to zero, then approve
+        let f = setup_with(
+            mainnet()
+                .rpc("eth_call:dd62ed3e", &word(5))
+                .get(OO_SWAP, Ok(Oo::usdc_to_eth().json())),
+            true,
+        );
+        let out = f.service.swap_tokens("w", PW, &params()).unwrap();
+        let purposes: Vec<_> = out
+            .get("approvals")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|a| text(a, &["purpose"]).unwrap())
+            .collect();
+        assert_eq!(purposes, vec!["reset_allowance", "approve"]);
+        assert_eq!(sends(&f), 3);
+        // already enough: no approval at all
+        let g = setup_with(
+            mainnet()
+                .rpc("eth_call:dd62ed3e", &word(25_000_000))
+                .get(OO_SWAP, Ok(Oo::usdc_to_eth().json())),
+            true,
+        );
+        let out = g.service.swap_tokens("w", PW, &params()).unwrap();
+        assert!(
+            out.get("approvals")
+                .and_then(Value::as_array)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(sends(&g), 1);
+        assert_eq!(oo_requests(&g).len(), 1);
+    }
+
+    #[test]
+    fn selling_the_native_coin_needs_no_approval() {
+        let f = setup(&Oo::eth_to_usdc(), true);
+        let mut p = params();
+        p.from_token = "native".into();
+        p.to_token = usdc();
+        p.amount = "0.01".into();
+        let out = f.service.swap_tokens("w", PW, &p).unwrap();
+        assert_eq!(text(&out, &["from", "symbol"]), Some("ETH"));
+        assert!(
+            out.get("approvals")
+                .and_then(Value::as_array)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(sends(&f), 1);
+    }
+
+    #[test]
+    fn min_receive_blocks_a_worse_quote_before_anything_is_sent() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let mut p = params();
+        p.min_receive = Some("0.0103".into());
+        assert!(
+            f.service
+                .swap_tokens("w", PW, &p)
+                .unwrap_err()
+                .contains("min_receive")
+        );
+        assert_eq!(sends(&f), 0);
+    }
+
+    #[test]
+    fn insufficient_balance_stops_before_calling_openocean_or_approving() {
+        let f = setup_with(
+            mainnet()
+                .rpc("eth_call:70a08231", &word(1_000_000))
+                .get(OO_SWAP, Ok(Oo::usdc_to_eth().json())),
+            true,
+        );
+        let err = f.service.swap_tokens("w", PW, &params()).unwrap_err();
+        assert!(err.contains("insufficient USDC") && err.contains("holds 1"));
+        assert_eq!(sends(&f), 0);
+        assert!(oo_requests(&f).is_empty());
+    }
+
+    #[test]
+    fn dangerous_quotes_are_refused_without_sending_anything() {
+        type Mutation = Box<dyn Fn(&mut Oo)>;
+        let cases: Vec<(Mutation, &str)> = vec![
+            (
+                Box::new(|o| o.to = "0x9999999999999999999999999999999999999999".into()),
+                "published router",
+            ),
+            (Box::new(|o| o.in_amount = "25000001".into()), "only"),
+            (Box::new(|o| o.value = "1".into()), "more native"),
+            (Box::new(|o| o.out_amount = "0".into()), "nothing"),
+            (Box::new(|o| o.impact = "-5.5%".into()), "price impact"),
+            (
+                Box::new(|o| o.in_addr = hex::encode_prefixed(&[0xcc; 20])),
+                "different sell token",
+            ),
+            (Box::new(|o| o.out_decimals = 6), "decimals"),
+        ];
+        for (mutate, expect) in cases {
+            let mut oo = Oo::usdc_to_eth();
+            mutate(&mut oo);
+            let f = setup(&oo, true);
+            let err = f.service.swap_tokens("w", PW, &params()).unwrap_err();
+            assert!(err.contains(expect), "{expect}: {err}");
+            assert_eq!(sends(&f), 0, "{expect}");
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_approval_aborts_the_swap() {
+        let f = setup_with(
+            mainnet()
+                .rpc("eth_getTransactionReceipt", "null")
+                .get(OO_SWAP, Ok(Oo::usdc_to_eth().json())),
+            true,
+        );
+        let err = f.service.swap_tokens("w", PW, &params()).unwrap_err();
+        assert!(err.contains("NOT sent") && err.contains("not confirmed"));
+        assert_eq!(sends(&f), 1, "only the approval went out");
+    }
+
+    #[test]
+    fn a_failed_approval_aborts_the_swap() {
+        let f = setup_with(
+            mainnet()
+                .rpc("eth_getTransactionReceipt", r#"{"status":"0x0"}"#)
+                .get(OO_SWAP, Ok(Oo::usdc_to_eth().json())),
+            true,
+        );
+        assert!(
+            f.service
+                .swap_tokens("w", PW, &params())
+                .unwrap_err()
+                .contains("failed on-chain")
+        );
+        assert_eq!(sends(&f), 1);
+    }
+
+    #[test]
+    fn a_swap_that_would_revert_sends_nothing() {
+        let router = mainnet()
+            .rpc("eth_call:dd62ed3e", &word(25_000_000))
+            .rpc_error(
+                "eth_estimateGas",
+                3,
+                "execution reverted: Too little received",
+                None,
+            )
+            .get(OO_SWAP, Ok(Oo::usdc_to_eth().json()));
+        let f = setup_with(router, true);
+        assert!(
+            f.service
+                .swap_tokens("w", PW, &params())
+                .unwrap_err()
+                .contains("Too little received")
+        );
+        assert_eq!(sends(&f), 0);
+    }
+
+    #[test]
+    fn an_api_block_or_wrong_password_sends_nothing() {
+        let f = setup_with(
+            mainnet().rpc("eth_call:dd62ed3e", &word(25_000_000)).get(
+                OO_SWAP,
+                Err("HTTP status 403 (blocked by Cloudflare bot protection)".into()),
+            ),
+            true,
+        );
+        assert!(
+            f.service
+                .swap_tokens("w", PW, &params())
+                .unwrap_err()
+                .contains("bot protection")
+        );
+        assert!(
+            f.service
+                .swap_tokens("w", "wrong-password", &params())
+                .is_err()
+        );
+        assert_eq!(sends(&f), 0);
+    }
+
+    #[test]
+    fn the_swap_goes_to_a_different_receiver_when_asked() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let mut p = params();
+        p.to_address = Some(to_checksum(&[0x22; 20]));
+        let out = f.service.swap_tokens("w", PW, &p).unwrap();
+        assert_eq!(
+            text(&out, &["to", "recipient"]),
+            Some(to_checksum(&[0x22; 20]).as_str())
+        );
+        assert!(oo_requests(&f).iter().all(|u| u.contains("sender=")));
+    }
+
+    #[test]
+    fn a_wallet_without_the_chain_cannot_swap_on_it() {
+        let f = setup(&Oo::usdc_to_eth(), true);
+        let mut p = params();
+        p.from_chain_id = 8453;
+        p.to_chain_id = 8453;
+        assert!(
+            f.service
+                .swap_tokens("w", PW, &p)
+                .unwrap_err()
+                .contains("add_network")
+        );
     }
 }

@@ -46,9 +46,21 @@ Every tool that touches a wallet needs the wallet's password; the wallet is unlo
 - `list_networks` (wallet_name, password) - helper for viewing a wallet's networks. Deleting a network also removes the tokens added on it.
 - `add_token` (wallet_name, chain_id, contract, password) - added beyond the original list; saves an ERC-20 token to the wallet on that network (any network the wallet has). The contract is checked on-chain and its symbol and decimals are read from it. Added tokens always appear in `get_wallet_balances`, even at zero. Stored in the encrypted vault; max 50 per network.
 - `remove_token` (wallet_name, chain_id, contract, password) - added beyond the original list; stops tracking an added token (no funds move). Built-in well-known tokens cannot be removed.
+- `get_swap_quote` (wallet_name, password, from_chain_id, from_token, to_chain_id, to_token, amount, optional slippage_bps / to_address) - added by request; previews a swap through OpenOcean without signing or sending anything: how much of the new token you will get (expected and guaranteed minimum), the fees (service fee, estimated network fee), the route, price impact, and whether an approval or more balance is needed.
+- `swap_tokens` (same parameters plus optional min_receive) - swaps through OpenOcean and broadcasts. Tokens are a contract address or `native`. If the sold token needs an approval, exactly the sold amount is approved first (a non-zero allowance is reset to zero first, as USDT requires) and confirmed before the swap is sent. `min_receive` is a safety floor: if the fresh quote's guaranteed minimum is lower, nothing is sent.
 - `view_seed_phrase`, `view_private_key` (wallet_name, password)
 - `export_wallet` (wallet_name, password, encryption_key, optional file_name) - writes a ZIP to `exports/` whose single entry is the seed phrase and private key encrypted with MetaMask's vault scheme under the given key. Never overwrites files.
 - `revoke_token_approval` (wallet_name, chain_id, password, token, spender) - useful for revoking smart-contract token approvals (sets the ERC-20 allowance to zero).
+
+### Swaps (OpenOcean)
+
+- **No API key, account or environment variable.** Swaps use an OpenOcean v4 swap API host (`https://open-api.de1.exchange/v4`, endpoint `/:chain/swap`). The host is the `OPENOCEAN_API_BASE_URL` setting in [core/src/swap_config.rs](core/src/swap_config.rs). Whoever runs that host supplies the transaction data the wallet signs, so only point it at a host you trust.
+- **Same-chain only.** OpenOcean's API swaps within one chain; its cross-chain swaps exist only in its web widget, and non-EVM chains (Solana, and so on) need a whitelisted key. So `to_chain_id` must equal `from_chain_id` (a different value returns an explanatory error), and there is no `to_blockchain` option: swaps such as ETH to BTC or SUI are not possible through this API. What *is* supported is `to_address`: an optional address on the same chain that receives the bought tokens instead of the wallet itself.
+- **Chains:** the 41 chains OpenOcean lists for its swap API (Ethereum, BNB Chain, Base, Polygon, Arbitrum, Optimism, Avalanche, and others). The wallet must have the network (see `add_network`). The wallet only ever approves or sends to OpenOcean's published router contract.
+- **Fee:** 0.7% (70 bps) of the amount sold, sent to OpenOcean as `referrer` / `referrerFee`. It is shown in every quote as `service_fee`. **Set your fee address in [core/src/swap_config.rs](core/src/swap_config.rs)** (`SWAP_FEE_RECIPIENT`); the rate is `SWAP_FEE_BPS` in the same file. While the address is empty no fee is charged (the server prints a notice to stderr at startup). An invalid address, or a rate outside 1-500 bps, makes the server refuse to start.
+- **Costs to know about:** OpenOcean also applies its own tiered fee on public-API swaps (0.01% stable pairs, 0.1% correlated, 0.25% common, 0.5% exotic tokens), inside the swap, and its docs say it keeps 20% of the referrer fee by default. Its docs do not describe how referrer fees are paid out; confirm that with OpenOcean and check your fee address after a first swap.
+- **Safety checks before signing:** the quote must be for the requested tokens (decimals included), may not sell more than requested or send extra native currency, must target OpenOcean's router, must meet `min_receive`, and may not have a price impact worse than 5%. The approval is for exactly the sold amount, never unlimited. OpenOcean text (route names, errors) is length-limited and stripped of control characters before it reaches the agent.
+- **Rate limit:** 2 requests per second on the free API. **Known issue:** OpenOcean's Cloudflare bot protection challenged the quote and swap endpoints (HTTP 403) when tested from a cloud server, so swaps may fail from some networks; the tools then say so and send nothing.
 
 Only Ethereum wallets can be created and used for now. Chain IDs select networks such as Base or Arbitrum; chains without chain IDs will not require one.
 
@@ -72,7 +84,7 @@ Hashing (SHA-2, Keccak), HMAC, PBKDF2, base64/hex, BIP39/BIP32, RLP, ABI, transa
 
 ### External services
 
-Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), and a Blockscout explorer (`eth.blockscout.com`, history). Custom networks supply their own RPC and explorer.
+Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). Custom networks supply their own RPC and explorer.
 
 ## Example input
 
@@ -242,6 +254,34 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remove_token","arguments":{"wallet_name":"Demo","password":"demo-password-123","chain_id":1,"contract":"0x514910771AF9Ca656af840dff83E8264EcF986CA"}}}' | cargo run -q
+```
+
+### Swaps
+
+Same-chain swaps through OpenOcean: no API key or setup needed. `0xA0b8...eB48` is USDC on Ethereum. The wallet needs the token (and a little ETH for gas).
+
+Preview a swap of 25 USDC to ETH. Nothing is signed or sent:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_swap_quote","arguments":{"wallet_name":"Demo","password":"demo-password-123","from_chain_id":1,"from_token":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","to_chain_id":1,"to_token":"native","amount":"25"}}}' | cargo run -q
+```
+
+Preview with a custom slippage (0.5%) and a different receiving address:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_swap_quote","arguments":{"wallet_name":"Demo","password":"demo-password-123","from_chain_id":1,"from_token":"native","to_chain_id":1,"to_token":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","amount":"0.01","slippage_bps":50,"to_address":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"}}}' | cargo run -q
+```
+
+Do the swap (spends real funds). `min_receive` is the `minimum_amount` from the quote, in whole units of the token you receive:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"swap_tokens","arguments":{"wallet_name":"Demo","password":"demo-password-123","from_chain_id":1,"from_token":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","to_chain_id":1,"to_token":"native","amount":"25","slippage_bps":50,"min_receive":"0.0102"}}}' | cargo run -q
+```
+
+Cross-chain swaps are not offered by OpenOcean's API; this returns an explanatory error:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_swap_quote","arguments":{"wallet_name":"Demo","password":"demo-password-123","from_chain_id":1,"from_token":"native","to_chain_id":8453,"to_token":"native","amount":"0.01"}}}' | cargo run -q
 ```
 
 ### Networks (layer 2s)
