@@ -22,4 +22,5 @@ pub mod random;
 pub mod secp256k1;
 pub mod secret;
 pub mod sha2;
+pub mod slip10;
 pub mod x25519;

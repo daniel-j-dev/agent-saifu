@@ -21,15 +21,42 @@ All-in-one crypto wallet for Agents. Built from the ground up in Rust.
 
 ## Current features
 
-The MCP server lives in `core/` (Rust, stdio JSON-RPC, run with `cargo run -q` from `core/`; an MCP client launches the binary). Wallet logic for Ethereum is in `core/src/eth/`. Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
+The MCP server lives in `core/` (Rust, stdio JSON-RPC, run with `cargo run -q` from `core/`; an MCP client launches the binary). Wallet logic for Ethereum is in `core/src/eth/`, for Sui in `core/src/sui/`. Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
 
 ### MCP tools
 
 Every tool that touches a wallet needs the wallet's password; the wallet is unlocked only for that single call and is locked again when it returns. Unlocking one wallet never unlocks another. Wallet names are unique (case-insensitive).
 
+Two blockchains are supported: **Ethereum** (and EVM chains, selected per call with `chain_id`) and **Sui** (a wallet is bound to one network, so there is no `chain_id`). The tool is chosen by the wallet it is given: a tool shared by both reads the wallet's blockchain and does the right thing. The next table says which tools work with which wallet; the descriptions below say how each behaves (Ethereum unless a "Sui:" note says otherwise).
+
+| Tool | Ethereum | Sui | Notes |
+|---|---|---|---|
+| `get_info` | yes | yes | |
+| `create_wallet` | yes | yes | Sui takes an optional `network` (`mainnet` default, `testnet`, `devnet`) |
+| `import_wallet` | yes | yes | Sui: 24-word seed phrase, `suiprivkey1...` key or 64-hex Ed25519 key |
+| `list_wallets`, `rename_wallet`, `delete_wallet` | yes | yes | |
+| `get_wallet_address` | yes | yes | |
+| `get_wallet_balances` | yes | yes | Sui lists every coin type held; no `chain_id` / `token_contracts` |
+| `send_asset` | yes | yes | Sui: SUI or any coin type; no `chain_id` / `gas_limit` |
+| `sign_contract_transaction` | yes | yes | Sui: signs a complete transaction (`transaction_bytes`); `broadcast=true` is sign-and-execute |
+| `sign_personal_message` | yes (EIP-191) | yes | added for the Wallet Standard `signPersonalMessage` |
+| `estimate_gas_fee`, `simulate_transaction` | yes | yes | Sui: a transfer, or given `transaction_bytes`; no `value` / `data` |
+| `get_transaction` | yes | yes | Sui: `transaction_hash` is the base58 digest |
+| `get_transaction_history` | yes | yes | Sui: transactions only (no `token_transfers`) |
+| `list_networks` | yes | yes | Sui: the one network the wallet is bound to |
+| `get_swap_quote`, `swap_tokens` | yes (OpenOcean) | yes (Cetus, mainnet) | Sui: no `from_chain_id` / `to_chain_id` |
+| `view_seed_phrase`, `view_private_key`, `export_wallet` | yes | yes | Sui keys are shown as `suiprivkey1...` (plus hex) |
+| `read_smart_contract` | yes | **no** | Sui has no equivalent call-by-signature; Move calls go through `sign_contract_transaction` |
+| `add_network`, `update_network`, `delete_network` | yes | **no** | a Sui wallet is bound to its one network |
+| `add_token`, `remove_token` | yes | **no** | a Sui wallet lists every coin it holds automatically |
+| `revoke_token_approval` | yes | **no** | Sui has no token allowances |
+| `wc_*` (WalletConnect) | yes | **no** | WalletConnect is EVM-only here; Sui dapps use the Wallet Standard, which the signing tools mirror (see "Sui wallets") |
+
+A Sui wallet given to an Ethereum-only tool (or the reverse) is refused with a clear message before anything is decrypted; chain-specific arguments given to the wrong wallet (for example `chain_id` for Sui) are refused too.
+
 - `get_info` - returns "All-in-one crypto wallet for Agents. Built from the ground up in Rust." and "Version 0.0".
-- `create_wallet` (blockchain, wallet_name, password) - new wallet with a 24-word seed phrase in a password-encrypted vault. Multiple wallets are supported.
-- `import_wallet` (wallet_name, password, seed_phrase *or* private_key) - add an existing wallet.
+- `create_wallet` (blockchain = `ethereum` or `sui`, wallet_name, password, optional network) - new wallet with a 24-word seed phrase in a password-encrypted vault. Multiple wallets are supported. `network` is for Sui only.
+- `import_wallet` (wallet_name, password, seed_phrase *or* private_key, optional blockchain / network) - add an existing wallet; `blockchain` defaults to `ethereum`.
 - `list_wallets` - names and blockchains only; no password.
 - `rename_wallet` (wallet_name, new_wallet_name, password) - added beyond the original list.
 - `delete_wallet` (wallet_name, password, confirm=true) - added beyond the original list; irreversible.
@@ -37,6 +64,7 @@ Every tool that touches a wallet needs the wallet's password; the wallet is unlo
 - `get_wallet_balances` (wallet_name, password, optional chain_id / token_contracts) - each asset with amount, USDC value, and chain ID, across all of the wallet's networks. Checks the native coin, a built-in list of well-known tokens, tokens saved with `add_token`, and any token contracts you pass for a one-off check. `usdc_value` is null when no real market price exists (testnets, unlisted tokens).
 - `send_asset` (wallet_name, chain_id, asset = `native` or token contract, to, amount, password) - signs and broadcasts.
 - `sign_contract_transaction` (wallet_name, chain_id, password, to, data, optional value / gas_limit / broadcast) - signs a smart-contract call; only broadcasts if `broadcast=true`. Decodes token transfers/approvals and warns about unlimited approvals.
+- `sign_personal_message` (wallet_name, password, message, optional message_format = `text` / `hex` / `base64`) - added for Sui's Wallet Standard `signPersonalMessage` and offered for both blockchains: Ethereum signs with EIP-191 `personal_sign`; Sui signs with Sui's personal-message intent. Nothing is sent and no network access is needed. The response shows the message text (or "(binary data)").
 - `estimate_gas_fee` (wallet_name, chain_id, password, to, optional value / data, or asset + amount) - gas, fee in native currency and USDC.
 - `simulate_transaction` (same parameters as estimate) - added beyond the original list; dry-runs the transaction before signing and reports success or the revert reason, fees, affordability and a decoded description.
 - `read_smart_contract` (wallet_name, chain_id, password, contract, function, optional args / outputs) - added beyond the original list; read-only call, nothing is signed.
@@ -69,7 +97,35 @@ Every tool that touches a wallet needs the wallet's password; the wallet is unlo
 - **Safety checks before signing:** the quote must be for the requested tokens (decimals included), may not sell more than requested or send extra native currency, must target OpenOcean's router, must meet `min_receive`, and may not have a price impact worse than 5%. The router calldata is also decoded locally (`swap(...)` on OpenOcean's router) and must sell the requested token and the quoted amount, buy the requested token, **deliver it to the wallet (or the requested `to_address`)** and guarantee a minimum return at least the quote's (and your `min_receive`); the quote's guaranteed minimum may also not be looser than the requested slippage (plus 0.5%). So a dishonest or compromised API host cannot redirect the output or hide a bad price; calldata the wallet cannot decode is refused and nothing is sent. The approval is for exactly the sold amount, never unlimited. OpenOcean text (route names, errors) is length-limited and stripped of control characters before it reaches the agent.
 - **Rate limit:** 2 requests per second on the free API. **Known issue:** OpenOcean's Cloudflare bot protection challenged the quote and swap endpoints (HTTP 403) when tested from a cloud server, so swaps may fail from some networks; the tools then say so and send nothing.
 
-Only Ethereum wallets can be created and used for now. Chain IDs select networks such as Base or Arbitrum; chains without chain IDs will not require one.
+Ethereum wallets use the OpenOcean aggregator (this section); Sui wallets use the Cetus aggregator (see "Swaps on Sui (Cetus)"). Chain IDs select Ethereum networks such as Base or Arbitrum; Sui has no chain IDs (a wallet is bound to a network), so Sui tools do not take one.
+
+### Sui wallets
+
+Sui wallets are created and used like Ethereum wallets (same vault encryption, per-call unlocking, password rate limiting, tools), with these specifics. They were built following Sui's documentation on the [Wallet Standard](https://docs.sui.io/onchain-finance/asset-custody/wallets/wallet-standard), [self-custodial wallets](https://docs.sui.io/onchain-finance/asset-custody/wallets/self-custody) and its [security best practices](https://docs.sui.io/develop/security/best-practices) for key management, and use the official [Sui Rust SDK](https://github.com/MystenLabs/sui-rust-sdk).
+
+- **Keys.** Ed25519, Sui's default scheme. A 24-word BIP39 seed phrase derives the key with SLIP-0010 at `m/44'/784'/0'/0'/0'` (the path every Sui wallet uses, so a phrase from Slush or the Sui CLI gives the same address). The address is the BLAKE2b-256 hash of `0x00` plus the public key, computed by the Sui SDK. Both the derivation and the signing formats are checked against an independent implementation (see the tests). Imported keys may be a `suiprivkey1...` Bech32 string, the Sui CLI keystore's base64 `flag || key`, or 64 hex characters; only Ed25519 keys are accepted. `view_private_key` / `export_wallet` give the `suiprivkey1...` form that Sui wallets import, plus hex.
+- **Self-custody.** Keys exist only inside the password-encrypted vault (same PBKDF2-SHA256 900,000 iterations + AES-256-GCM format as the Ethereum wallets, with MetaMask's keyring layout), are decrypted for one call and wiped afterwards, and never leave the machine. The wallet file holds only the name, blockchain and vault: the address, the network and the keys are inside the vault.
+- **One network per wallet.** Sui's guidance is to keep Testnet and Mainnet keys separate so a test key can never sign a production transaction. A Sui wallet is therefore bound to one network (`mainnet` by default; `testnet` or `devnet` with `network` on `create_wallet` / `import_wallet`), recorded inside the vault. Every call first checks that the endpoint really is that network (mainnet and testnet by their chain identifier) and signing refuses a transaction that names another network. Create separate wallets for separate networks, and separate wallets for unrelated activity (everything on Sui is public).
+- **Hardware wallets and multisig are not supported.** Sui's guidance prefers a hardware wallet or multisig for privileged (admin/deployer) keys; this wallet is a hot wallet and is meant for routine operation. Keep recovery material offline: back up the seed phrase with `view_seed_phrase`, never in plaintext or screenshots, and send a small test transfer before moving a large amount.
+- **Verify recipients.** A recipient must be written out in full (`0x` + 64 hex characters, the zero address is refused): a mistyped short address would otherwise send coins somewhere unrecoverable.
+- **Node access.** Public Sui nodes retired JSON-RPC, so reads, dry runs and submission go through Sui's GraphQL API (`graphql.mainnet.sui.io`, `graphql.testnet.sui.io`, `graphql.devnet.sui.io`) over HTTPS with certificate checking. Transactions are built offline with the Sui SDK's `TransactionBuilder` from data read over GraphQL.
+- **Coins and address balances.** A balance is the sum of the coin objects the address owns and its *address balance* (Sui's newer account-style balance; many wallets hold SUI only that way). Both are shown (`coin_objects_raw`, `address_balance_raw`) and both can be spent and can pay gas: gas is paid from coin objects when they cover it, otherwise from the address balance (a transaction with an `expiration` bound to the current epoch and the chain).
+- **Gas.** Gas price is the network's reference price. The budget comes from a dry run (computation + a margin + storage - rebate, as Sui's TypeScript SDK does, capped at the protocol's 50 SUI) and the final transaction is dry-run again before signing. A transaction whose dry run fails is never signed.
+- **Per-action unlock and double submission.** The wallet is unlocked only for the call. Sui executes a given signed transaction at most once; if the answer to a submission is lost or any error comes back, the transaction's digest (computed locally before submitting) is looked up first; if the node has it, it is reported as executed, and only when the node answered with a validation error and has no such transaction is it called rejected. If it still cannot be confirmed the error returns the digest and says not to send again before checking with `get_transaction`.
+- **Wallet Standard mapping.** The Wallet Standard is a browser-extension interface (account discovery, events, signing). The wallet is not a browser extension, so its signing features are offered as MCP tools with the same inputs and outputs: `sui:signTransaction` = `sign_contract_transaction` with `broadcast=false` (returns `bytes` and `signature` exactly as the standard does, plus a decoded description and a dry run); `sui:signAndExecuteTransaction` = the same tool with `broadcast=true`; `sui:signPersonalMessage` = `sign_personal_message`. The legacy `...TransactionBlock` features use the same bytes. `standard:connect` / `standard:events` have no meaning without a browser (the account is `get_wallet_address`; the supported chain is the wallet's network, `sui:mainnet` / `sui:testnet` / `sui:devnet`, shown by `list_networks`). Signing follows Sui's intent scheme: a transaction is signed over `blake2b-256(intent [0,0,0] || bytes)` and a personal message over `blake2b-256(intent [3,0,0] || bcs(message))`, so a message signature can never be replayed as a transaction (tested).
+- **What `sign_contract_transaction` checks for Sui.** The bytes must decode as a user transaction whose sender and gas owner is this wallet (sponsored and system transactions are refused), and a transaction bound to another network is refused. The response describes every command (Move calls with package/module/function, transfers, splits, merges, publishes), warns about publishing or upgrading packages, about transferring the gas coin itself, and about a failing dry run, and reports the wallet's balance changes from the dry run. `broadcast=true` is refused unless the dry run succeeds. This wallet cannot decode a Move call into plain language beyond its target; read the description and the balance changes before approving.
+- **Prices.** `usdc_value` for SUI comes from CoinGecko, USDC is valued at 1, and the first few other coins from the Cetus aggregator's quote for selling the whole balance; it is `null` on testnet and devnet and wherever no price exists. Coins without on-chain metadata (unknown decimals) are shown in base units and can neither be sent nor swapped.
+- **Text from the network** (coin symbols, error messages) is length-limited and stripped of control characters before it reaches the agent.
+
+### Swaps on Sui (Cetus)
+
+Sui swaps go through the [Cetus aggregator](https://cetus-1.gitbook.io/cetus-developer-docs/developer/cetus-aggregator/getting-started) (`https://api-sui.cetus.zone/router_v3`). No API key, account or environment variable is needed.
+
+- **How it works.** The aggregator's API only finds the best route. The wallet builds the transaction itself the way the aggregator's SDK does, in one transaction: open a swap context holding the input coin (`router::new_swap_context_v3`, which records the quoted output, the allowed slippage and the fee), call each pool (`cetus::swap`), and confirm (`router::confirm_swap_v3`), which makes the aggregator's contract abort the whole transaction on-chain if the output is below the minimum. The output coin is sent to the wallet (or `to_address`). The transaction is dry-run before it is signed, and a dry run that shows less than the minimum stops the swap.
+- **Mainnet only, Cetus pools only.** Cetus's own testnet support is limited, so swaps need a mainnet wallet. The aggregator can also route through many other exchanges, but each needs its own transaction code that must be verified individually; only routes made entirely of Cetus's pools (provider `CETUS`) are requested and accepted. Routes may have several hops and split across pools. Cross-chain swaps are not offered.
+- **Safety checks before signing.** The route must sell exactly the requested coin and amount and end in the requested coin, use only Cetus pools, never spend a coin before it has been produced, add up to its quoted output, and not be priced more than 5% away from the market (`deviation_ratio`). The route's packages are checked on-chain: every hop must call exactly the newest published version of Cetus's router package and the transaction opens the newest version of the aggregator package (both resolved from their original package IDs, which are pinned in the code); every pool, the global config and the partner object must be Cetus objects (types defined by Cetus's CLMM package) and each pool must hold the coins the route claims in the stated order. So a dishonest or compromised API cannot point the wallet at other code or other pools. The contract enforces the minimum output (`slippage_bps`, default 100 = 1%, 5 to 1000) on-chain, and `min_receive` is an additional floor on the quote's guaranteed minimum. Because the aggregator supplies both the price and the numbers that guard it, the quote is also checked against an independent price where one exists: for SUI against USDC it must be within 5% of CoinGecko's SUI price. For any other pair (or if CoinGecko is unreachable) no independent price exists, so `swap_tokens` then **requires `min_receive`** (the least you would accept, from a price you trust) and `get_swap_quote` says so in `price_check`.
+- **Costs to know about.** The pools charge their own trading fee inside the price (shown per hop as `fee_rate`); the network fee is paid in SUI.
+- **Known limits.** The aggregator's public API has a rate limit; tiny amounts are often refused by the price-deviation check; Sui coins without metadata cannot be swapped; a quote moves with the market, so `swap_tokens` fetches a fresh one.
 
 ### WalletConnect (any dapp)
 
@@ -95,15 +151,15 @@ The wallet speaks the WalletConnect v2 Sign protocol as the wallet side, so any 
 
 - Vault encryption matches MetaMask's `browser-passworder`: PBKDF2-HMAC-SHA256 (900,000 iterations, 32-byte salt) derives an AES-256-GCM key (16-byte IV); the vault is `{data, iv, salt, keyMetadata}` in base64. The vault plaintext uses MetaMask's keyring layout (`HD Key Tree` / `Simple Key Pair`). Verified against vaults produced and read by WebCrypto.
 - The wallet file holds only the name, blockchain and vault. Addresses, balances, networks, added tokens and keys exist only inside the encrypted vault. Files are `0600`, directories `0700`; writes are atomic and never overwrite exports.
-- Seed phrases are always 24 words (BIP39, checksum-validated); keys derive at `m/44'/60'/0'/0/0`.
-- Passwords must be at least 8 characters (export keys 12). Five wrong passwords lock a wallet for 60 seconds.
+- Seed phrases are always 24 words (BIP39, checksum-validated); Ethereum keys derive at `m/44'/60'/0'/0/0`, Sui keys (Ed25519, SLIP-0010) at `m/44'/784'/0'/0'/0'`.
+- Passwords must be at least 8 characters (export keys 12). Five wrong passwords lock a wallet for 60 seconds (the same limiter covers Ethereum and Sui wallets). A tool for one blockchain given a wallet of the other is refused before anything is decrypted.
 - Secrets are wiped from memory after each call where possible; request/response buffers are zeroed. Secrets are never logged and are never included in error messages.
 - Text coming from third parties (token names, explorer data) is shortened and stripped of control characters before it reaches an agent; RPC URLs must be https (http only for localhost) and may not be literal private-network IPv4 addresses.
 - No double payments on a lost broadcast response. Before every broadcast the signed transaction (hash, nonce, raw bytes; no keys) is saved in `$AGENT_SAIFU_HOME/pending/` and removed once the node answers. If the response is lost (timeout, network error), the record stays and the error says the outcome is unknown and not to retry. The next send from that wallet on that network first looks the transaction up: if the node has it, nothing is sent and the agent is told it was already accepted; if not, the identical signed bytes are resubmitted (same nonce, so never a second payment) and reported; if the node can't be reached, nothing is sent until it can be checked.
 
 ### Dependencies
 
-Hashing (SHA-2, Keccak), HMAC, PBKDF2, HKDF, base64/base58/hex, BIP39/BIP32, RLP, ABI, EIP-191 and EIP-712 signing, transaction signing, the WalletConnect protocol logic, ZIP and JSON are implemented in this repository and tested against published vectors. Only primitives that are risky to hand-roll use crates, each checked against the RustSec advisory database (all advisories are fixed in the versions locked in `Cargo.lock`) and crates.io download counts:
+Hashing (SHA-2, Keccak), HMAC, PBKDF2, HKDF, base64/base58/hex, BIP39/BIP32, SLIP-0010, RLP, ABI, EIP-191 and EIP-712 signing, transaction signing, the WalletConnect protocol logic, ZIP and JSON are implemented in this repository and tested against published vectors. Only primitives that are risky to hand-roll use crates, each checked against the RustSec advisory database (all advisories are fixed in the versions locked in `Cargo.lock`, apart from the informational `ring` notice below) and crates.io download counts:
 
 - `k256` 0.14 (RustCrypto; secp256k1 ECDSA, constant-time) - ~90M downloads
 - `aes-gcm` 0.11 (RustCrypto; NCC Group audited) - ~186M downloads
@@ -113,9 +169,15 @@ Hashing (SHA-2, Keccak), HMAC, PBKDF2, HKDF, base64/base58/hex, BIP39/BIP32, RLP
 - `x25519-dalek` 3.0 (WalletConnect key agreement) and `ed25519-dalek` 3.0 (relay authentication), both dalek-cryptography - ~87M and ~248M downloads. The RustSec advisories for `ed25519-dalek` (RUSTSEC-2022-0093, fixed in 2.0) and `curve25519-dalek` (RUSTSEC-2024-0344, fixed in 4.1.3) are fixed in the locked versions.
 - `tungstenite` 0.30 (WebSocket framing for the relay, handshake only, no TLS of its own) - ~360M downloads; its advisory RUSTSEC-2023-0065 is fixed since 0.20.1. TLS is the same `rustls` (ring) already used by `ureq`, with `webpki-roots` for certificates.
 
+Sui support uses the official Sui Rust SDK (https://github.com/MystenLabs/sui-rust-sdk, Mysten Labs, Apache-2.0), as requested, instead of hand-rolling Sui's transaction encoding. Only SDK crates that are needed are used, with default features switched off where possible (no gRPC/tonic stack, no zkLogin, passkey or multisig code):
+
+- `sui-sdk-types` 0.4 (Sui transaction/address/type definitions, BCS encoding, digests; ~359k downloads), `sui-crypto` 0.4 (Ed25519 keys, `suiprivkey` Bech32, transaction and personal-message signing in Sui's intent scheme; ~122k downloads) and `sui-transaction-builder` 0.4 (offline programmable-transaction builder, `intents` feature off; ~116k downloads). These have far fewer downloads than the other crates above because Sui's Rust SDK is young and specialised, but they are the SDK Mysten Labs publishes for this purpose; their signing and addressing output was also cross-checked against independent implementations (see the tests). Their dependencies are widely used RustCrypto/serde crates (`ed25519-dalek` 2.2 ~249M downloads, `curve25519-dalek` 4.1.3, `blake2` ~188M, `sha2`, `bcs` ~9.8M, `bech32` ~64M, `bs58` ~168M, `serde_with` ~412M, `roaring` ~59M, `bnum` ~21M).
+- SLIP-0010 (Ed25519 key derivation), the MetaMask-style Sui vault, GraphQL access and the Cetus aggregator integration are implemented in this repository.
+- Audit result (RustSec advisory database checked on 2026-10-24 against every package in `Cargo.lock`): no advisory applies to the locked versions of the new Sui dependencies (`ed25519-dalek` 2.2.0 and `curve25519-dalek` 4.1.3 are past RUSTSEC-2022-0093 and RUSTSEC-2024-0344). The audit also found two timing advisories published the day before, RUSTSEC-2026-0385 (`ctutils`) and RUSTSEC-2026-0387 (`crypto-bigint`), in crates that `k256` already pulled in for Ethereum signing; `Cargo.lock` now pins their patched versions (`ctutils` 0.4.5, `crypto-bigint` 0.7.6). One informational notice remains: `ring` 0.17.14 is flagged "unmaintained" (RUSTSEC-2025-0007) through `rustls`, which was already the case.
+
 ### External services
 
-Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). The WalletConnect relay (`relay.walletconnect.org`, needs a free project ID). Custom networks supply their own RPC and explorer.
+Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). The WalletConnect relay (`relay.walletconnect.org`, needs a free project ID). Custom networks supply their own RPC and explorer. For Sui: the network's GraphQL endpoint (`graphql.mainnet.sui.io`, `graphql.testnet.sui.io` or `graphql.devnet.sui.io`; reads, dry runs, submission) and the Cetus aggregator (`api-sui.cetus.zone`, routes for swaps and indicative prices; no key); SUI prices also come from CoinGecko.
 
 ## Usage Examples
 
@@ -145,7 +207,7 @@ List every tool with its input schema:
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | cargo run -q
 ```
 
-### Wallets
+### Ethereum Wallets
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_wallet","arguments":{"blockchain":"ethereum","wallet_name":"Demo","password":"demo-password-123"}}}' | cargo run -q
@@ -341,7 +403,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_network","arguments":{"wallet_name":"Demo","password":"demo-password-123","chain_id":8453}}}' | cargo run -q
 ```
 
-### WalletConnect
+### WalletConnect (Ethereum & layer 2s only)
 
 Sessions live in the server process, so run these in one process (piped lines, or an MCP client that keeps the server running). Set the project ID first (see the WalletConnect section above) and use a wallet that has a network for the chain the dapp wants:
 
@@ -380,6 +442,84 @@ Disconnect a dapp (use `wc_list_sessions` for the topic):
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wc_disconnect_session","arguments":{"session_topic":"<session_topic>"}}}' | cargo run -q
+```
+
+### Sui wallets
+
+Sui wallets use the same tools; there is no `chain_id` (the wallet is bound to the network it was created for). Create one (mainnet by default; add `"network":"testnet"` for a test wallet):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_wallet","arguments":{"blockchain":"sui","wallet_name":"Sui Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_wallet","arguments":{"blockchain":"sui","wallet_name":"Sui Testnet","password":"demo-password-123","network":"testnet"}}}' | cargo run -q
+```
+
+Import a seed phrase (the well-known public test phrase; never use it for real funds) or a `suiprivkey1...` key as shown by Slush or the Sui CLI:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"import_wallet","arguments":{"blockchain":"sui","wallet_name":"Sui Imported","password":"import-password-1","seed_phrase":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet_address","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+Every coin the address holds (coin objects and address balance), with USD values on mainnet:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet_balances","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+Estimate and dry-run a transfer, then send it (spends real funds if the wallet is funded; the recipient is written out in full; `asset` is `native` for SUI or a coin type such as `0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC`):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"simulate_transaction","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123","asset":"native","amount":"0.1","to":"0x0000000000000000000000000000000000000000000000000000000000000abc"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_asset","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123","asset":"native","amount":"0.1","to":"0x0000000000000000000000000000000000000000000000000000000000000abc"}}}' | cargo run -q
+```
+
+Sign a transaction built elsewhere (base64 BCS `TransactionData`; this is Wallet Standard `sui:signTransaction`; add `"broadcast":true` for `sui:signAndExecuteTransaction`) and a personal message (`sui:signPersonalMessage`):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sign_contract_transaction","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123","transaction_bytes":"<base64 transaction bytes>"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sign_personal_message","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123","message":"Sign in to example.app"}}}' | cargo run -q
+```
+
+Look up a transaction by digest, and list recent activity:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_transaction","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123","transaction_hash":"<digest>"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_transaction_history","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123","limit":5}}}' | cargo run -q
+```
+
+Swap through the Cetus aggregator (mainnet wallets only; no `from_chain_id` / `to_chain_id`). Preview first, then swap with the quote's `minimum_amount` as `min_receive`:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_swap_quote","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123","from_token":"native","to_token":"0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC","amount":"1"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"swap_tokens","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123","from_token":"native","to_token":"0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC","amount":"1","slippage_bps":50,"min_receive":"0.95"}}}' | cargo run -q
+```
+
+The key in the format Sui wallets import (`suiprivkey1...`) and the network the wallet is bound to:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"view_private_key","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_networks","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123"}}}' | cargo run -q
 ```
 
 ### Several requests in one session

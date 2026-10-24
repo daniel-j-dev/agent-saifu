@@ -7,6 +7,7 @@ use agent_saifu_core::http::UreqClient;
 use agent_saifu_core::server;
 use agent_saifu_core::service::WalletService;
 use agent_saifu_core::store::{self, Store};
+use agent_saifu_core::sui::cetus::CetusSettings;
 use agent_saifu_core::tools::Toolbox;
 use agent_saifu_core::walletconnect::manager::WcManager;
 use agent_saifu_core::walletconnect::relay::build_relay;
@@ -21,6 +22,12 @@ fn run() -> Result<(), String> {
             "agent-saifu: no swap fee recipient is set (core/src/swap_config.rs), so swaps will not charge a fee"
         );
     }
+    let cetus_settings = CetusSettings::from_config()?;
+    if cetus_settings.fee.is_none() {
+        eprintln!(
+            "agent-saifu: no Sui swap fee recipient is set (core/src/sui_swap_config.rs), so Sui swaps will not charge a fee"
+        );
+    }
     let project_id = std::env::var(walletconnect_config::PROJECT_ID_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -28,6 +35,7 @@ fn run() -> Result<(), String> {
     let relay = build_relay(&project_id, walletconnect_config::WALLETCONNECT_RELAY_URL);
     let service = WalletService::new(store, Rc::new(UreqClient::new()))
         .with_swap_settings(swap_settings)
+        .with_cetus_settings(cetus_settings)
         .with_walletconnect(WcManager::new(relay));
     let toolbox = Toolbox::new(service);
     let stdin = io::stdin();

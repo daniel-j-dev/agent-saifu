@@ -9,6 +9,16 @@ Built from the ground up in Rust. Driven entirely through MCP.
 
 <br>
 
+## Blockchain coverage
+
+| Blockchain | Status |
+|------------|--------|
+| Ethereum | ✅ Fully covered |
+| ETH Layer 2s (Base, Arbitrum, Optimism and any EVM network you add) | ✅ Fully covered |
+| Sui (mainnet, testnet, devnet; swaps on mainnet via Cetus) | ✅ Covered (see the tool table in spec.md for what works with which wallet) |
+| Solana | 🔜 Soon |
+| Bitcoin | 🔜 Soon |
+
 <p align="center">
   <img src="promo-images/03-mcp-tools.svg" alt="An agent calls MCP tools such as get_wallet_balances, get_swap_quote, simulate_transaction and swap_tokens and receives structured results" width="860">
 </p>
@@ -44,22 +54,14 @@ Pair with Uniswap, OpenSea, Aave and more over WalletConnect v2. The agent revie
 - **Per-action unlock:** one wallet at a time, locked again after every call. Addresses and balances stay hidden until unlocked.
 - **Multiple wallets:** create or import wallets, each with its own password, networks and tokens.
 - **Ethereum and layer 2s:** add custom networks per wallet and check balances across all of them, with USDC values.
+- **Sui:** create or import Ed25519 wallets (the same 24-word phrases and `suiprivkey` keys as Slush and the Sui CLI), bound to mainnet, testnet or devnet, built on the official Sui Rust SDK. Send any coin, sign transactions and messages (Wallet Standard equivalents), and swap through the Cetus aggregator.
 - **Safe transactions:** estimate fees, simulate before signing, decode approvals, and revoke them when finished.
-- **Token swaps:** quotes and swaps through OpenOcean, with local calldata verification and slippage protection.
+- **Token swaps:** quotes and swaps through OpenOcean (Ethereum) and Cetus (Sui), with local verification and slippage protection.
 - **WalletConnect v2:** connect to any dapp, review the expected outcome of each request, then approve or reject it.
 - **No double payments:** signed transactions are recorded before broadcast, so a lost response is never paid twice.
 - **Minimal dependencies:** hashing, ABI, RLP, EIP-712, BIP32/39 and WalletConnect logic are implemented in-repo and tested against published vectors.
 - **Encrypted export:** back up a wallet as a ZIP protected with MetaMask's vault scheme.
 
-## Blockchain coverage
-
-| Blockchain | Status |
-|------------|--------|
-| Ethereum | ✅ Fully covered |
-| ETH Layer 2s (Base, Arbitrum, Optimism and any EVM network you add) | ✅ Fully covered |
-| Solana | 🔜 Soon |
-| Sui | 🔜 Soon |
-| Bitcoin | 🔜 Soon |
 
 ## Setup + Learn more
 

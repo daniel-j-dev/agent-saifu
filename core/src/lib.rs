@@ -14,6 +14,8 @@ pub mod protocol;
 pub mod server;
 pub mod service;
 pub mod store;
+pub mod sui;
+pub mod sui_swap_config;
 pub mod swap_config;
 pub mod tools;
 pub mod vault;

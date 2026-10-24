@@ -23,10 +23,17 @@ use crate::eth::wallet::{VaultContents, validate_export_key, validate_password};
 use crate::http::HttpClient;
 use crate::json::Value;
 use crate::store::{Store, WalletRecord, validate_wallet_name, write_new_private_file};
+use crate::sui::cetus::CetusSettings;
+use crate::sui::wallet::SuiVault;
 use crate::vault;
 use crate::walletconnect::manager::WcManager;
 use crate::walletconnect::relay::UnavailableRelay;
 use crate::zip;
+
+mod sui;
+mod sui_swap;
+#[cfg(test)]
+mod sui_tests;
 
 pub const MAX_FAILED_ATTEMPTS: u32 = 5;
 pub const LOCKOUT: Duration = Duration::from_secs(60);
@@ -68,7 +75,8 @@ impl AttemptLimiter {
 }
 
 /// Parameters shared by gas estimation and simulation: either a token/native transfer
-/// (`asset` + `amount` + `to`) or a raw call (`to` + optional `value` and `data`).
+/// (`asset` + `amount` + `to`) or a raw call (`to` + optional `value` and `data`). For Sui wallets
+/// a raw call is given as `transaction_bytes` instead.
 #[derive(Debug, Default, Clone)]
 pub struct IntentParams {
     pub to: Option<String>,
@@ -76,6 +84,7 @@ pub struct IntentParams {
     pub data: Option<String>,
     pub asset: Option<String>,
     pub amount: Option<String>,
+    pub transaction_bytes: Option<String>,
 }
 
 pub struct WalletService {
@@ -86,6 +95,7 @@ pub struct WalletService {
     limiter: RefCell<AttemptLimiter>,
     iterations: u32,
     swap: SwapSettings,
+    cetus: CetusSettings,
     /// Pause between receipt checks and how many checks to make when waiting on an approval.
     receipt_wait: (Duration, u32),
 }
@@ -199,6 +209,7 @@ impl WalletService {
             limiter: RefCell::new(AttemptLimiter::default()),
             iterations: vault::DEFAULT_ITERATIONS,
             swap: SwapSettings::default(),
+            cetus: CetusSettings::default(),
             receipt_wait: (Duration::from_secs(3), 60),
         }
     }
@@ -225,21 +236,27 @@ impl WalletService {
         self
     }
 
-    pub(crate) fn unlock(
-        &self,
-        name: &str,
-        password: &str,
-    ) -> Result<(WalletRecord, VaultContents), String> {
+    /// Loads the wallet file and applies the empty-password check and the lockout, so a wrong
+    /// guess is rate limited no matter which blockchain the wallet is on.
+    fn open_record(&self, name: &str, password: &str) -> Result<(WalletRecord, Instant), String> {
         if password.is_empty() {
             return Err("password is required".to_string());
         }
         let now = Instant::now();
         self.limiter.borrow().check(name, now)?;
-        let record = self.store.load(name)?;
-        match VaultContents::unseal(&record.vault, password) {
+        Ok((self.store.load(name)?, now))
+    }
+
+    fn unseal_with<T>(
+        &self,
+        name: &str,
+        now: Instant,
+        unsealed: Result<T, String>,
+    ) -> Result<T, String> {
+        match unsealed {
             Ok(contents) => {
                 self.limiter.borrow_mut().record_success(name);
-                Ok((record, contents))
+                Ok(contents)
             }
             Err(e) if e == vault::WRONG_PASSWORD => {
                 self.limiter.borrow_mut().record_failure(name, now);
@@ -247,6 +264,69 @@ impl WalletService {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn wrong_chain(record: &WalletRecord, needed: Blockchain) -> String {
+        format!(
+            "wallet '{}' is a {} wallet, but this operation needs a {} wallet",
+            record.name,
+            record.blockchain.display_name(),
+            needed.display_name()
+        )
+    }
+
+    /// Unlocks an Ethereum wallet for one action. Sui wallets are refused before any decryption.
+    pub(crate) fn unlock(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> Result<(WalletRecord, VaultContents), String> {
+        let (record, now) = self.open_record(name, password)?;
+        if record.blockchain != Blockchain::Ethereum {
+            return Err(Self::wrong_chain(&record, Blockchain::Ethereum));
+        }
+        let contents =
+            self.unseal_with(name, now, VaultContents::unseal(&record.vault, password))?;
+        Ok((record, contents))
+    }
+
+    /// Unlocks a Sui wallet for one action.
+    pub(crate) fn unlock_sui(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> Result<(WalletRecord, SuiVault), String> {
+        let (record, now) = self.open_record(name, password)?;
+        if record.blockchain != Blockchain::Sui {
+            return Err(Self::wrong_chain(&record, Blockchain::Sui));
+        }
+        let contents = self.unseal_with(name, now, SuiVault::unseal(&record.vault, password))?;
+        Ok((record, contents))
+    }
+
+    /// Checks the password of a wallet on any blockchain (rename, delete).
+    fn authenticate(&self, name: &str, password: &str) -> Result<WalletRecord, String> {
+        let (record, now) = self.open_record(name, password)?;
+        match record.blockchain {
+            Blockchain::Ethereum => {
+                self.unseal_with(name, now, VaultContents::unseal(&record.vault, password))
+                    .map(|_| ())?;
+            }
+            Blockchain::Sui => {
+                self.unseal_with(name, now, SuiVault::unseal(&record.vault, password))
+                    .map(|_| ())?;
+            }
+        }
+        Ok(record)
+    }
+
+    /// Which blockchain a wallet is on; tools shared by several blockchains dispatch on it.
+    /// The file reveals only the chain, never keys or addresses.
+    pub(crate) fn chain_of(&self, name: &str, password: &str) -> Result<Blockchain, String> {
+        if password.is_empty() {
+            return Err("password is required".to_string());
+        }
+        Ok(self.store.load(name)?.blockchain)
     }
 
     fn seal_and_save(
@@ -275,14 +355,34 @@ impl WalletService {
         name: &str,
         password: &str,
     ) -> Result<Value, String> {
+        self.create_wallet_on(blockchain, name, password, None)
+    }
+
+    /// `network` (mainnet, testnet, devnet) applies to Sui wallets only; the default is mainnet.
+    pub fn create_wallet_on(
+        &self,
+        blockchain: &str,
+        name: &str,
+        password: &str,
+        network: Option<&str>,
+    ) -> Result<Value, String> {
         let chain = Blockchain::parse(blockchain)?;
         let name = validate_wallet_name(name)?;
         validate_password(password)?;
+        let sui_network = Self::wallet_network(chain, network)?;
         if self.store.exists(&name) {
             return Err(format!("a wallet named '{name}' already exists"));
         }
-        let contents = VaultContents::create_new()?;
-        self.store_new_wallet(chain, name, password, &contents, "created")
+        match chain {
+            Blockchain::Ethereum => {
+                let contents = VaultContents::create_new()?;
+                self.store_new_wallet(chain, name, password, &contents, "created")
+            }
+            Blockchain::Sui => {
+                let contents = SuiVault::create_new(sui_network)?;
+                self.sui_store_new(name, password, &contents, "created")
+            }
+        }
     }
 
     pub fn import_wallet(
@@ -293,18 +393,68 @@ impl WalletService {
         seed_phrase: Option<&str>,
         private_key: Option<&str>,
     ) -> Result<Value, String> {
+        self.import_wallet_on(blockchain, name, password, seed_phrase, private_key, None)
+    }
+
+    pub fn import_wallet_on(
+        &self,
+        blockchain: &str,
+        name: &str,
+        password: &str,
+        seed_phrase: Option<&str>,
+        private_key: Option<&str>,
+        network: Option<&str>,
+    ) -> Result<Value, String> {
         let chain = Blockchain::parse(blockchain)?;
         let name = validate_wallet_name(name)?;
         validate_password(password)?;
-        let contents = match (seed_phrase, private_key) {
-            (Some(s), None) => VaultContents::from_mnemonic(s)?,
-            (None, Some(k)) => VaultContents::from_private_key(k)?,
-            _ => return Err("provide exactly one of seed_phrase or private_key".to_string()),
-        };
-        if self.store.exists(&name) {
-            return Err(format!("a wallet named '{name}' already exists"));
+        let sui_network = Self::wallet_network(chain, network)?;
+        if seed_phrase.is_some() == private_key.is_some() {
+            return Err("provide exactly one of seed_phrase or private_key".to_string());
         }
-        self.store_new_wallet(chain, name, password, &contents, "imported")
+        match chain {
+            Blockchain::Ethereum => {
+                if private_key.is_some_and(|k| k.trim().starts_with("suiprivkey")) {
+                    return Err(
+                        "this looks like a Sui private key; set blockchain to \"sui\"".to_string(),
+                    );
+                }
+                let contents = match (seed_phrase, private_key) {
+                    (Some(s), None) => VaultContents::from_mnemonic(s)?,
+                    (None, Some(k)) => VaultContents::from_private_key(k)?,
+                    _ => unreachable!("exactly one secret was checked above"),
+                };
+                if self.store.exists(&name) {
+                    return Err(format!("a wallet named '{name}' already exists"));
+                }
+                self.store_new_wallet(chain, name, password, &contents, "imported")
+            }
+            Blockchain::Sui => {
+                let contents = match (seed_phrase, private_key) {
+                    (Some(s), None) => SuiVault::from_mnemonic(s, sui_network)?,
+                    (None, Some(k)) => SuiVault::from_private_key(k, sui_network)?,
+                    _ => unreachable!("exactly one secret was checked above"),
+                };
+                if self.store.exists(&name) {
+                    return Err(format!("a wallet named '{name}' already exists"));
+                }
+                self.sui_store_new(name, password, &contents, "imported")
+            }
+        }
+    }
+
+    /// The Sui network a new wallet is bound to; Ethereum wallets take no network.
+    fn wallet_network(
+        chain: Blockchain,
+        network: Option<&str>,
+    ) -> Result<crate::sui::network::SuiNetwork, String> {
+        match (chain, network) {
+            (Blockchain::Sui, n) => Self::sui_network_arg(n),
+            (Blockchain::Ethereum, None) => Ok(crate::sui::network::SuiNetwork::Mainnet),
+            (Blockchain::Ethereum, Some(_)) => Err(
+                "'network' applies to Sui wallets only; Ethereum networks are chosen per call with chain_id and managed with add_network".to_string(),
+            ),
+        }
     }
 
     fn store_new_wallet(
@@ -354,7 +504,7 @@ impl WalletService {
         new_name: &str,
         password: &str,
     ) -> Result<Value, String> {
-        let (record, _contents) = self.unlock(name, password)?;
+        let record = self.authenticate(name, password)?;
         let renamed = self.store.rename(&record.name, new_name)?;
         Ok(Value::object(vec![
             ("old_name", Value::String(record.name)),
@@ -371,12 +521,15 @@ impl WalletService {
         if !confirm {
             return Err("deleting a wallet is irreversible and destroys its keys; set confirm to true after backing up the seed phrase".to_string());
         }
-        let (record, _contents) = self.unlock(name, password)?;
+        let record = self.authenticate(name, password)?;
         self.store.delete(&record.name)?;
         Ok(Value::object(vec![("deleted", Value::String(record.name))]))
     }
 
     pub fn get_address(&self, name: &str, password: &str) -> Result<Value, String> {
+        if self.chain_of(name, password)? == Blockchain::Sui {
+            return self.sui_address(name, password);
+        }
         let (record, contents) = self.unlock(name, password)?;
         let address = contents.address()?;
         Ok(Value::object(vec![
@@ -389,6 +542,9 @@ impl WalletService {
     // ---- secrets ------------------------------------------------------------
 
     pub fn view_seed_phrase(&self, name: &str, password: &str) -> Result<Value, String> {
+        if self.chain_of(name, password)? == Blockchain::Sui {
+            return self.sui_seed_phrase(name, password);
+        }
         let (record, contents) = self.unlock(name, password)?;
         let phrase = contents
             .mnemonic()
@@ -404,6 +560,9 @@ impl WalletService {
     }
 
     pub fn view_private_key(&self, name: &str, password: &str) -> Result<Value, String> {
+        if self.chain_of(name, password)? == Blockchain::Sui {
+            return self.sui_private_key(name, password);
+        }
         let (record, contents) = self.unlock(name, password)?;
         let key = contents.private_key()?;
         let address = contents.address()?;
@@ -421,6 +580,42 @@ impl WalletService {
         ]))
     }
 
+    /// EIP-191 `personal_sign` with an Ethereum wallet.
+    pub fn eth_sign_message(
+        &self,
+        name: &str,
+        password: &str,
+        message: &str,
+        format: Option<&str>,
+    ) -> Result<Value, String> {
+        let bytes = crate::sui::tx::parse_message(message, format)?;
+        let (record, contents) = self.unlock(name, password)?;
+        let key = contents.private_key_array()?;
+        let signature = crate::eth::sign::sign_personal_message(&key.0, &bytes)?;
+        let readable = std::str::from_utf8(&bytes)
+            .ok()
+            .filter(|t| !t.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+        Ok(Value::object(vec![
+            ("wallet", Value::String(record.name)),
+            ("address", Value::String(to_checksum(&contents.address()?))),
+            ("signature", Value::String(hex::encode_prefixed(&signature))),
+            (
+                "message_hash",
+                Value::String(hex::encode_prefixed(
+                    &crate::eth::sign::personal_message_hash(&bytes),
+                )),
+            ),
+            (
+                "message_preview",
+                match readable {
+                    Some(text) => Value::String(crate::eth::explorer::sanitize_text_max(text, 500)),
+                    None => Value::str("(binary data)"),
+                },
+            ),
+            ("standard", Value::str("EIP-191 personal_sign")),
+        ]))
+    }
+
     pub fn export_wallet(
         &self,
         name: &str,
@@ -433,8 +628,18 @@ impl WalletService {
             Some(f) => validate_export_file_name(f)?,
             None => default_export_name(name),
         };
-        let (record, contents) = self.unlock(name, password)?;
-        let payload = export_payload(&record.name, record.blockchain, &contents)?;
+        let (wallet_name, payload, has_seed_phrase) = match self.chain_of(name, password)? {
+            Blockchain::Sui => {
+                let (record, vault) = self.unlock_sui(name, password)?;
+                let payload = Self::sui_export_payload(&record.name, &vault)?;
+                (record.name, payload, vault.mnemonic().is_some())
+            }
+            Blockchain::Ethereum => {
+                let (record, contents) = self.unlock(name, password)?;
+                let payload = export_payload(&record.name, record.blockchain, &contents)?;
+                (record.name, payload, contents.mnemonic().is_some())
+            }
+        };
         let sealed = vault::encrypt(encryption_key, payload.expose(), vault::DEFAULT_ITERATIONS)?;
         let sealed_json = sealed.to_json().to_json();
         let archive = zip::build_zip(&[(EXPORT_ENTRY_NAME, sealed_json.as_bytes())])?;
@@ -443,12 +648,12 @@ impl WalletService {
             format!("cannot write export (existing files are never overwritten): {e}")
         })?;
         Ok(Value::object(vec![
-            ("name", Value::String(record.name)),
+            ("name", Value::String(wallet_name)),
             ("file", Value::String(path.to_string_lossy().into_owned())),
             ("entry", Value::str(EXPORT_ENTRY_NAME)),
             (
                 "contains",
-                Value::str(if contents.mnemonic().is_some() {
+                Value::str(if has_seed_phrase {
                     "seed phrase and private key"
                 } else {
                     "private key"
@@ -467,6 +672,9 @@ impl WalletService {
     // ---- networks -----------------------------------------------------------
 
     pub fn view_networks(&self, name: &str, password: &str) -> Result<Value, String> {
+        if self.chain_of(name, password)? == Blockchain::Sui {
+            return self.sui_networks(name, password);
+        }
         let (record, contents) = self.unlock(name, password)?;
         let list = networks::all_networks(&contents.networks)
             .iter()
