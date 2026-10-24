@@ -374,6 +374,19 @@ impl WcManager {
             _ => return,
         }
         let respond_error = |this: &Self, code: i64, message: &str| {
+            // Diagnostics for the operator only (stderr); never includes request contents.
+            eprintln!(
+                "walletconnect: refused a dapp request ({}): {}",
+                sanitize_text_max(
+                    params
+                        .get("request")
+                        .and_then(|r| r.get("method"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                    60
+                ),
+                sanitize_text_max(message, 160)
+            );
             this.reply_error(topic, id, proto::METHOD_REQUEST, code, message);
         };
         let Some(request_id) = id.as_u64() else {

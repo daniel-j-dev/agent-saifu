@@ -363,3 +363,87 @@ fn malformed_sui_requests_are_rejected_to_the_dapp() {
     assert_eq!(w.pending(), 0);
     assert!(w.answer().get("error").is_some());
 }
+
+#[test]
+fn a_failed_submission_closes_the_request() {
+    let relay = Rc::new(MockRelay::default());
+    let manager = WcManager::new(relay.clone()).with_settle_wait(Duration::ZERO);
+    let rejecting = SuiMock::new()
+        .errors("executeTransaction", "object locked")
+        .extend(node(&[(1, 5_000_000_000)], 0));
+    let f = build(rejecting, |s| s.with_walletconnect(manager));
+    import(&f);
+    let mut w = Wc {
+        f,
+        relay,
+        dapp: Dapp::new(),
+    };
+    w.connect();
+    let bytes = tx::encode(&own_transaction(5_000_000)).unwrap();
+    w.request(
+        23,
+        "sui:mainnet",
+        "sui_signAndExecuteTransaction",
+        &tx_params(&bytes, &wallet_address()),
+    );
+    assert!(w.f.service.wc_approve_request_sui(23, "w", PW).is_err());
+    assert_eq!(w.pending(), 0, "the request must not be approvable again");
+    assert!(w.answer().get("error").is_some());
+}
+
+#[test]
+fn a_dapps_serialized_transaction_is_resolved_given_gas_and_signed() {
+    let mut w = wc();
+    w.connect();
+    let me = wallet_address();
+    // Splits 1000 MIST off the gas coin and sends it to the wallet itself.
+    let draft = format!(
+        r#"{{"version":2,"sender":"{me}","expiration":null,
+        "gasData":{{"budget":null,"price":null,"owner":null,"payment":null}},
+        "inputs":[{{"Pure":{{"bytes":"6AMAAAAAAAA="}}}},{{"Pure":{{"bytes":"{}"}}}}],
+        "commands":[{{"SplitCoins":{{"coin":{{"GasCoin":true}},"amounts":[{{"Input":0}}]}}}},
+          {{"TransferObjects":{{"objects":[{{"NestedResult":[0,0]}}],"address":{{"Input":1}}}}}}]}}"#,
+        crate::crypto::base64::encode(&crate::sui::coins::parse_address(&me).unwrap().into_inner())
+    );
+    let params = Value::object(vec![
+        ("transaction", Value::String(draft)),
+        ("address", Value::String(me.clone())),
+    ])
+    .to_json();
+    w.request(14, "sui:mainnet", "sui_signTransaction", &params);
+    assert_eq!(w.pending(), 1);
+    let review = w.f.service.wc_review_request_sui(14, "w", PW).unwrap();
+    assert_eq!(
+        field(&review, &["simulation_succeeded"]),
+        &Value::Bool(true)
+    );
+
+    w.f.service.wc_approve_request_sui(14, "w", PW).unwrap();
+    let answer = w.answer();
+    let result = answer.get("result").unwrap();
+    let signed = tx::decode(text(result, &["transactionBytes"])).unwrap();
+    assert_eq!(signed.sender.to_string(), me);
+    assert_eq!(signed.gas_payment.owner.to_string(), me);
+    assert!(!signed.gas_payment.objects.is_empty());
+    assert!(signed.gas_payment.budget > 0);
+    let signature = UserSignature::from_base64(text(result, &["signature"])).unwrap();
+    assert_signed_by_wallet(&signed, &signature);
+}
+
+#[test]
+fn a_serialized_transaction_from_another_sender_is_refused() {
+    let mut w = wc();
+    w.connect();
+    let other = format!("0x{}", "ab".repeat(32));
+    let draft = format!(
+        r#"{{"version":2,"sender":"{other}","inputs":[],"commands":[{{"MergeCoins":{{"destination":{{"GasCoin":true}},"sources":[]}}}}]}}"#
+    );
+    let params = Value::object(vec![
+        ("transaction", Value::String(draft)),
+        ("address", Value::String(wallet_address())),
+    ])
+    .to_json();
+    w.request(15, "sui:mainnet", "sui_signTransaction", &params);
+    let err = w.f.service.wc_review_request_sui(15, "w", PW).unwrap_err();
+    assert!(err.contains("sender is not this wallet"), "{err}");
+}

@@ -266,6 +266,51 @@ fn finish(
     Ok(transaction)
 }
 
+/// Wraps already-built commands (a dapp's) into a transaction that pays gas as `gas` says.
+pub fn wrap_commands(
+    sender: Address,
+    env: &GasEnv,
+    budget: u64,
+    gas: &GasChoice,
+    inputs: Vec<Input>,
+    commands: Vec<Command>,
+) -> Transaction {
+    let (objects, expiration) = match gas {
+        GasChoice::Coins(chosen) => (
+            chosen
+                .iter()
+                .map(|c| sui_sdk_types::ObjectReference::new(c.id, c.version, c.digest))
+                .collect(),
+            TransactionExpiration::None,
+        ),
+        GasChoice::AddressBalance => (
+            vec![],
+            TransactionExpiration::ValidDuring {
+                min_epoch: Some(env.epoch),
+                max_epoch: Some(env.epoch),
+                min_timestamp: None,
+                max_timestamp: None,
+                chain: env.chain,
+                nonce: env.nonce,
+            },
+        ),
+    };
+    Transaction {
+        kind: TransactionKind::ProgrammableTransaction(sui_sdk_types::ProgrammableTransaction {
+            inputs,
+            commands,
+        }),
+        sender,
+        gas_payment: sui_sdk_types::GasPayment {
+            objects,
+            owner: sender,
+            price: env.price,
+            budget,
+        },
+        expiration,
+    }
+}
+
 /// Adds a transfer of `coin` to `recipient`.
 pub fn transfer_body(
     recipient: Address,

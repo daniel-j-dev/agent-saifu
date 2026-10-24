@@ -6,6 +6,7 @@ pub mod cetus;
 pub mod coins;
 pub mod gql;
 pub mod network;
+pub mod sdk_json;
 #[cfg(test)]
 pub mod testing;
 pub mod tx;

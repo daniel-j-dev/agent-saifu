@@ -52,6 +52,9 @@ pub struct SuiRequest {
     pub address: Option<sui_sdk_types::Address>,
     /// The transaction for the two transaction kinds, decoded from base64 BCS `TransactionData`.
     pub transaction: Option<Box<sui_sdk_types::Transaction>>,
+    /// Instead of `transaction`: the SDK's serialized JSON form, which the wallet still has to
+    /// resolve against the network and give gas.
+    pub draft: Option<Box<crate::sui::sdk_json::Draft>>,
     /// The personal message, taken as UTF-8 text.
     pub message: Vec<u8>,
 }
@@ -229,6 +232,7 @@ fn parse_sui(method: &str, params: &Value) -> Result<Action, String> {
                 kind: SuiKind::GetAccounts,
                 address: None,
                 transaction: None,
+                draft: None,
                 message: vec![],
             }));
         }
@@ -252,16 +256,28 @@ fn parse_sui(method: &str, params: &Value) -> Result<Action, String> {
             kind,
             address: Some(address),
             transaction: None,
+            draft: None,
             message: message.as_bytes().to_vec(),
         }));
     }
-    let transaction = crate::sui::tx::decode(
-        text("transaction").ok_or_else(|| format!("{method} needs the 'transaction'"))?,
-    )?;
+    let raw =
+        text("transaction").ok_or_else(|| format!("{method} needs a string 'transaction'"))?;
+    if raw.trim_start().starts_with('{') {
+        let draft = crate::sui::sdk_json::parse(raw)?;
+        return Ok(Action::Sui(SuiRequest {
+            kind,
+            address: Some(address),
+            transaction: None,
+            draft: Some(Box::new(draft)),
+            message: vec![],
+        }));
+    }
+    let transaction = crate::sui::tx::decode(raw)?;
     Ok(Action::Sui(SuiRequest {
         kind,
         address: Some(address),
         transaction: Some(Box::new(transaction)),
+        draft: None,
         message: vec![],
     }))
 }

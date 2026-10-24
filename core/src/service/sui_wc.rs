@@ -129,10 +129,73 @@ impl WalletService {
         })
     }
 
-    fn wc_sui_transaction(sui: &SuiRequest) -> Result<&sui_sdk_types::Transaction, String> {
-        sui.transaction
+    /// The transaction to sign. A dapp's serialized JSON form has its objects resolved from the
+    /// network and is given gas here; the gas budget comes from a dry run.
+    fn wc_sui_transaction(
+        s: &Session<'_>,
+        sui: &SuiRequest,
+    ) -> Result<sui_sdk_types::Transaction, String> {
+        if let Some(transaction) = &sui.transaction {
+            return Ok((**transaction).clone());
+        }
+        let draft = sui
+            .draft
             .as_deref()
-            .ok_or_else(|| "the request has no transaction".to_string())
+            .ok_or_else(|| "the request has no transaction".to_string())?;
+        if draft.sender != s.owner {
+            return Err(
+                "the transaction's sender is not this wallet; refusing to sign it".to_string(),
+            );
+        }
+        let (inputs, commands) = draft.resolve(|id| {
+            s.gql
+                .object(id)?
+                .ok_or_else(|| format!("the transaction uses object {id}, which does not exist"))
+        })?;
+        let epoch = s.gql.epoch()?;
+        let env = tx::GasEnv {
+            price: epoch.reference_gas_price,
+            epoch: epoch.epoch,
+            chain: s
+                .chain
+                .parse::<sui_sdk_types::Digest>()
+                .map_err(|_| "the Sui node reported an invalid chain identifier".to_string())?,
+            nonce: tx::fresh_nonce()?,
+        };
+        let holdings = Self::sui_holdings(s, crate::sui::coins::SUI_COIN_TYPE)?;
+        // A transaction that uses the gas coin may spend any of it, so every coin is offered.
+        let also_needed = if draft.uses_gas_coin() { u64::MAX } else { 0 };
+        let build = |budget: u64| -> Result<sui_sdk_types::Transaction, String> {
+            let gas = tx::select_gas(&holdings, budget, also_needed)?;
+            Ok(tx::wrap_commands(
+                s.owner,
+                &env,
+                budget,
+                &gas,
+                inputs.clone(),
+                commands.clone(),
+            ))
+        };
+        // Reserving a huge budget can leave too little in the gas coin for what the transaction
+        // spends, so smaller trial budgets are tried too.
+        let ceiling = tx::max_budget(&holdings);
+        let mut failure = "not enough SUI to pay for gas".to_string();
+        for trial in [1_000_000_000u64, 100_000_000, 20_000_000] {
+            let trial = trial.min(ceiling);
+            if trial < env.price.saturating_mul(2000) {
+                continue;
+            }
+            let dry = s.gql.simulate(&tx::encode(&build(trial)?)?)?;
+            if dry.success {
+                let budget = tx::budget_from_simulation(&dry.gas, env.price).min(ceiling);
+                return build(budget);
+            }
+            failure = format!(
+                "the transaction would fail: {}",
+                dry.error.as_deref().unwrap_or("unknown reason")
+            );
+        }
+        Err(failure)
     }
 
     pub(crate) fn wc_review_request_sui(
@@ -183,8 +246,9 @@ impl WalletService {
                 ));
             }
             SuiKind::SignTransaction | SuiKind::SignAndExecute => {
-                let transaction = Self::wc_sui_transaction(&open.sui)?;
                 let s = self.sui_session(&open.vault)?;
+                let transaction = Self::wc_sui_transaction(&s, &open.sui)?;
+                let transaction = &transaction;
                 tx::check_signable(transaction, &s.owner)?;
                 Self::sui_check_chain(transaction, &s)?;
                 let (summary, mut warnings) = tx::describe(transaction, &s.owner);
@@ -256,8 +320,9 @@ impl WalletService {
                 )
             }
             SuiKind::SignTransaction | SuiKind::SignAndExecute => {
-                let transaction = Self::wc_sui_transaction(&open.sui)?;
                 let s: Session<'_> = self.sui_session(&open.vault)?;
+                let transaction = Self::wc_sui_transaction(&s, &open.sui)?;
+                let transaction = &transaction;
                 tx::check_signable(transaction, &s.owner)?;
                 Self::sui_check_chain(transaction, &s)?;
                 if open.sui.kind == SuiKind::SignTransaction {
@@ -296,7 +361,21 @@ impl WalletService {
                             ));
                         }
                     }
-                    let submitted = Self::sui_submit(&s, &open.vault, transaction)?;
+                    // Once submission starts the request is closed whatever happens, so it can never be
+                    // approved (and submitted) a second time.
+                    let submitted = match Self::sui_submit(&s, &open.vault, transaction) {
+                        Ok(submitted) => submitted,
+                        Err(e) => {
+                            let _ = self.wc.borrow_mut().answer_request(
+                                request_id,
+                                Err((
+                                    crate::walletconnect::proto::USER_REJECTED,
+                                    "The transaction could not be confirmed".to_string(),
+                                )),
+                            );
+                            return Err(format!("{e} (the dapp request has been closed)"));
+                        }
+                    };
                     (
                         Value::object(vec![("digest", Value::str(&submitted.digest))]),
                         Self::sui_submission_report(&s, &submitted),

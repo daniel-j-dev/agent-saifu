@@ -98,6 +98,7 @@ pub struct TransactionInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectInfo {
     pub version: u64,
+    pub digest: Option<Digest>,
     pub initial_shared_version: Option<u64>,
     pub type_repr: Option<String>,
 }
@@ -367,13 +368,14 @@ impl<'a> Gql<'a> {
     }
 
     pub fn object(&self, id: &Address) -> Result<Option<ObjectInfo>, String> {
-        const QUERY: &str = "query($id: SuiAddress!) { object(address: $id) { version owner { __typename ... on Shared { initialSharedVersion } } asMoveObject { contents { type { repr } } } } }";
+        const QUERY: &str = "query($id: SuiAddress!) { object(address: $id) { version digest owner { __typename ... on Shared { initialSharedVersion } } asMoveObject { contents { type { repr } } } } }";
         let data = self.run(QUERY, vec![("id", Value::String(id.to_string()))])?;
         let Some(object) = data.get("object").filter(|o| !matches!(o, Value::Null)) else {
             return Ok(None);
         };
         Ok(Some(ObjectInfo {
             version: u64_of(object.get("version")).ok_or("object has no version")?,
+            digest: text_of(object.get("digest")).and_then(|d| d.parse().ok()),
             initial_shared_version: object
                 .get("owner")
                 .and_then(|o| o.get("initialSharedVersion"))
