@@ -15,6 +15,14 @@ pub const SUPPORTED_METHODS: [&str; 5] = [
     "eth_signTypedData_v4",
 ];
 
+/// Methods answered for Sui wallets (Reown's Sui RPC reference).
+pub const SUI_SUPPORTED_METHODS: [&str; 4] = [
+    "sui_getAccounts",
+    "sui_signTransaction",
+    "sui_signAndExecuteTransaction",
+    "sui_signPersonalMessage",
+];
+
 const MAX_CHAINS: usize = 50;
 const MAX_ITEMS: usize = 100;
 const MAX_TEXT: usize = 200;
@@ -58,13 +66,29 @@ pub struct Requirements {
     pub events: Vec<String>,
 }
 
+/// What one side of a proposal asks for on Sui, with chains like `sui:mainnet`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SuiRequirements {
+    pub chains: Vec<String>,
+    pub methods: Vec<String>,
+    pub events: Vec<String>,
+}
+
+impl SuiRequirements {
+    pub fn is_empty(&self) -> bool {
+        self.chains.is_empty() && self.methods.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposalData {
     pub proposer_public: [u8; 32],
     pub dapp: DappMetadata,
     pub required: Requirements,
     pub optional: Requirements,
-    /// Required namespaces other than `eip155` (e.g. `solana`), which cannot be provided.
+    pub sui_required: SuiRequirements,
+    pub sui_optional: SuiRequirements,
+    /// Required namespaces other than `eip155` and `sui` (e.g. `solana`), which cannot be provided.
     pub unsupported_required: Vec<String>,
     pub expiry: Option<u64>,
 }
@@ -83,6 +107,17 @@ pub fn parse_chain_reference(text: &str) -> Result<u64, String> {
     }
     id.parse::<u64>()
         .map_err(|_| format!("invalid chain '{}'", sanitize_text_max(text, 40)))
+}
+
+/// `sui:<network>` -> the reference after the colon.
+pub fn parse_sui_chain(text: &str) -> Result<String, String> {
+    let id = text
+        .strip_prefix("sui:")
+        .ok_or_else(|| format!("'{}' is not a Sui chain", sanitize_text_max(text, 40)))?;
+    if id.is_empty() || id.len() > 32 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!("invalid chain '{}'", sanitize_text_max(text, 40)));
+    }
+    Ok(text.to_string())
 }
 
 fn push_unique<T: PartialEq>(list: &mut Vec<T>, item: T) {
@@ -151,6 +186,35 @@ fn parse_namespaces(map: Option<&Value>) -> Result<(Requirements, Vec<String>), 
     Ok((out, other))
 }
 
+/// Reads the `sui` entries of a namespace map; keys are `sui` or `sui:<network>`.
+fn parse_sui_namespaces(map: Option<&Value>) -> Result<SuiRequirements, String> {
+    let mut out = SuiRequirements::default();
+    let Some(Value::Object(pairs)) = map else {
+        return Ok(out);
+    };
+    for (key, ns) in pairs {
+        if key.split(':').next() != Some("sui") {
+            continue;
+        }
+        if key.contains(':') {
+            push_unique(&mut out.chains, parse_sui_chain(key)?);
+        }
+        for chain in string_list(ns.get("chains"), "chains")? {
+            push_unique(&mut out.chains, parse_sui_chain(&chain)?);
+        }
+        for method in string_list(ns.get("methods"), "methods")? {
+            push_unique(&mut out.methods, method);
+        }
+        for event in string_list(ns.get("events"), "events")? {
+            push_unique(&mut out.events, event);
+        }
+    }
+    if out.chains.len() > MAX_CHAINS {
+        return Err("the proposal names too many chains".to_string());
+    }
+    Ok(out)
+}
+
 pub fn parse_proposal(params: &Value) -> Result<ProposalData, String> {
     let proposer = params.get("proposer").ok_or("proposal has no proposer")?;
     let key_hex = proposer
@@ -159,13 +223,18 @@ pub fn parse_proposal(params: &Value) -> Result<ProposalData, String> {
         .ok_or("proposal has no proposer public key")?;
     let proposer_public = hex::decode_fixed::<32>(key_hex)
         .map_err(|_| "the proposer public key is invalid".to_string())?;
-    let (required, unsupported_required) = parse_namespaces(params.get("requiredNamespaces"))?;
+    let (required, mut unsupported_required) = parse_namespaces(params.get("requiredNamespaces"))?;
+    unsupported_required.retain(|n| n != "sui");
     let (optional, _) = parse_namespaces(params.get("optionalNamespaces"))?;
+    let sui_required = parse_sui_namespaces(params.get("requiredNamespaces"))?;
+    let sui_optional = parse_sui_namespaces(params.get("optionalNamespaces"))?;
     Ok(ProposalData {
         proposer_public,
         dapp: DappMetadata::from_json(proposer.get("metadata")),
         required,
         optional,
+        sui_required,
+        sui_optional,
         unsupported_required,
         expiry: params.get("expiryTimestamp").and_then(Value::as_u64),
     })
@@ -194,6 +263,12 @@ pub fn plan_approval(proposal: &ProposalData, chosen: &[u64]) -> Result<Approval
             "the dapp requires namespaces this wallet cannot provide ({}); reject the proposal",
             proposal.unsupported_required.join(", ")
         ));
+    }
+    if !proposal.sui_required.is_empty() {
+        return Err(
+            "the dapp requires Sui, which an Ethereum wallet cannot provide; approve with a Sui wallet or reject the proposal"
+                .to_string(),
+        );
     }
     let unsupported: Vec<&str> = proposal
         .required
@@ -278,6 +353,125 @@ pub fn plan_approval(proposal: &ProposalData, chosen: &[u64]) -> Result<Approval
     })
 }
 
+/// What the wallet grants a dapp on Sui: one chain, the wallet's own network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuiApproval {
+    pub chain: String,
+    pub methods: Vec<String>,
+    pub events: Vec<String>,
+}
+
+/// Checks a proposal against a Sui wallet whose network is `chain` (e.g. `sui:mainnet`).
+pub fn plan_sui_approval(proposal: &ProposalData, chain: &str) -> Result<SuiApproval, String> {
+    if !proposal.unsupported_required.is_empty() {
+        return Err(format!(
+            "the dapp requires namespaces this wallet cannot provide ({}); reject the proposal",
+            proposal.unsupported_required.join(", ")
+        ));
+    }
+    if !proposal.required.chains.is_empty() || !proposal.required.methods.is_empty() {
+        return Err(
+            "the dapp requires Ethereum (eip155), which a Sui wallet cannot provide; approve with an Ethereum wallet or reject the proposal"
+                .to_string(),
+        );
+    }
+    let (req, opt) = (&proposal.sui_required, &proposal.sui_optional);
+    let others: Vec<String> = req
+        .chains
+        .iter()
+        .filter(|c| c.as_str() != chain)
+        .map(|c| sanitize_text_max(c, 40))
+        .collect();
+    if !others.is_empty() {
+        return Err(format!(
+            "the dapp requires {} but this wallet is on {chain}; a Sui wallet is bound to one network",
+            others.join(", ")
+        ));
+    }
+    if !req.chains.iter().chain(&opt.chains).any(|c| c == chain) {
+        let asked: Vec<String> = req
+            .chains
+            .iter()
+            .chain(&opt.chains)
+            .map(|c| sanitize_text_max(c, 40))
+            .collect();
+        return Err(format!(
+            "the dapp did not ask for {chain}; it asked for {}",
+            if asked.is_empty() {
+                "no Sui chain".to_string()
+            } else {
+                asked.join(", ")
+            }
+        ));
+    }
+    let unsupported: Vec<String> = req
+        .methods
+        .iter()
+        .filter(|m| !SUI_SUPPORTED_METHODS.contains(&m.as_str()))
+        .map(|m| sanitize_text_max(m, 60))
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "the dapp requires methods this wallet does not support ({}); reject the proposal",
+            unsupported.join(", ")
+        ));
+    }
+    let mut methods: Vec<String> = vec![];
+    for method in req.methods.iter().chain(&opt.methods) {
+        if SUI_SUPPORTED_METHODS.contains(&method.as_str()) {
+            push_unique(&mut methods, method.clone());
+        }
+    }
+    // Reown requires sui_getAccounts for Sui connections.
+    push_unique(&mut methods, "sui_getAccounts".to_string());
+    let mut events: Vec<String> = vec![];
+    for event in req.events.iter().chain(&opt.events) {
+        if event
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            push_unique(&mut events, event.clone());
+        }
+    }
+    Ok(SuiApproval {
+        chain: chain.to_string(),
+        methods,
+        events,
+    })
+}
+
+/// Base64 of the Sui public key with the Ed25519 flag byte in front, as `sui_getAccounts` returns.
+pub fn sui_pubkey_text(public_key: &[u8; 32]) -> String {
+    let mut flagged = vec![0u8];
+    flagged.extend_from_slice(public_key);
+    crate::crypto::base64::encode(&flagged)
+}
+
+/// The `sui_getAccounts` answer: `[{pubkey, address}]`.
+pub fn sui_accounts_value(public_key: &[u8; 32], address: &str) -> Value {
+    Value::Array(vec![Value::object(vec![
+        ("pubkey", Value::String(sui_pubkey_text(public_key))),
+        ("address", Value::str(address)),
+    ])])
+}
+
+/// The `namespaces` object of `wc_sessionSettle` for a Sui wallet.
+pub fn sui_settle_namespaces(approval: &SuiApproval, address: &str) -> Value {
+    let strings = |items: Vec<String>| Value::Array(items.into_iter().map(Value::String).collect());
+    Value::object(vec![(
+        "sui",
+        Value::object(vec![
+            ("chains", strings(vec![approval.chain.clone()])),
+            (
+                "accounts",
+                strings(vec![format!("{}:{address}", approval.chain)]),
+            ),
+            ("methods", strings(approval.methods.clone())),
+            ("events", strings(approval.events.clone())),
+        ]),
+    )])
+}
+
 pub fn all_chains(proposal: &ProposalData) -> Vec<u64> {
     let mut chains = proposal.required.chains.clone();
     for c in &proposal.optional.chains {
@@ -326,6 +520,97 @@ mod tests {
             "expiryTimestamp":1700000300}}"#
         ))
         .unwrap()
+    }
+
+    fn sui_proposal(required: &str, optional: &str) -> ProposalData {
+        proposal(&format!(
+            r#"{{"proposer":{{"publicKey":"{PUB}","metadata":{{"name":"D","description":"d","url":"https://d.example"}}}},
+            "requiredNamespaces":{required},"optionalNamespaces":{optional}}}"#
+        ))
+        .unwrap()
+    }
+
+    const SUI_REQUIRED: &str = r#"{"sui":{"chains":["sui:mainnet"],"methods":["sui_signTransaction","sui_signPersonalMessage"],"events":[]}}"#;
+
+    #[test]
+    fn parses_sui_namespaces_and_does_not_call_them_unsupported() {
+        let p = sui_proposal(
+            SUI_REQUIRED,
+            r#"{"sui:testnet":{"methods":["sui_signAndExecuteTransaction"],"events":["x"]}}"#,
+        );
+        assert!(p.unsupported_required.is_empty());
+        assert_eq!(p.sui_required.chains, vec!["sui:mainnet"]);
+        assert_eq!(p.sui_optional.chains, vec!["sui:testnet"]);
+        assert_eq!(
+            p.sui_optional.methods,
+            vec!["sui_signAndExecuteTransaction"]
+        );
+        assert!(p.required.chains.is_empty());
+        assert!(proposal(&format!(
+            r#"{{"proposer":{{"publicKey":"{PUB}"}},"requiredNamespaces":{{"sui:main net":{{}}}}}}"#
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn plans_a_sui_approval_on_the_wallets_network() {
+        let p = sui_proposal(
+            SUI_REQUIRED,
+            r#"{"sui":{"chains":["sui:testnet"],"methods":["sui_signAndExecuteTransaction","sui_nope"],"events":["a b"]}}"#,
+        );
+        let a = plan_sui_approval(&p, "sui:mainnet").unwrap();
+        assert_eq!(a.chain, "sui:mainnet");
+        assert_eq!(
+            a.methods,
+            vec![
+                "sui_signTransaction",
+                "sui_signPersonalMessage",
+                "sui_signAndExecuteTransaction",
+                "sui_getAccounts"
+            ]
+        );
+        assert!(a.events.is_empty());
+        let ns = sui_settle_namespaces(&a, "0xabc");
+        let sui = ns.get("sui").unwrap();
+        assert_eq!(
+            sui.get("accounts").unwrap().as_array().unwrap()[0].as_str(),
+            Some("sui:mainnet:0xabc")
+        );
+    }
+
+    #[test]
+    fn refuses_mismatched_blockchains_networks_and_methods() {
+        let p = sui_proposal(SUI_REQUIRED, "{}");
+        let err = plan_sui_approval(&p, "sui:testnet").unwrap_err();
+        assert!(err.contains("requires sui:mainnet"), "{err}");
+        let err = plan_approval(&p, &[1]).unwrap_err();
+        assert!(err.contains("requires Sui"), "{err}");
+        let eth = sample();
+        let err = plan_sui_approval(&eth, "sui:mainnet").unwrap_err();
+        assert!(err.contains("requires Ethereum"), "{err}");
+        let p = sui_proposal(
+            r#"{"sui":{"chains":["sui:mainnet"],"methods":["sui_sign_everything"],"events":[]}}"#,
+            "{}",
+        );
+        let err = plan_sui_approval(&p, "sui:mainnet").unwrap_err();
+        assert!(err.contains("does not support"), "{err}");
+        let p = sui_proposal("{}", r#"{"sui":{"chains":["sui:testnet"],"methods":[]}}"#);
+        let err = plan_sui_approval(&p, "sui:mainnet").unwrap_err();
+        assert!(err.contains("did not ask for sui:mainnet"), "{err}");
+    }
+
+    #[test]
+    fn sui_accounts_carry_the_flagged_public_key() {
+        let v = sui_accounts_value(&[7u8; 32], "0x1");
+        let key = v.as_array().unwrap()[0]
+            .get("pubkey")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        let raw = crate::crypto::base64::decode(key).unwrap();
+        assert_eq!(raw.len(), 33);
+        assert_eq!(raw[0], 0);
+        assert_eq!(&raw[1..], &[7u8; 32]);
     }
 
     #[test]

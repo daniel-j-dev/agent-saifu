@@ -15,7 +15,7 @@ Built from the ground up in Rust. Driven entirely through MCP.
 |------------|--------|
 | Ethereum | ✅ Fully covered |
 | ETH Layer 2s (Base, Arbitrum, Optimism and any EVM network you add) | ✅ Fully covered |
-| Sui (mainnet, testnet, devnet; swaps on mainnet via Cetus) | ✅ Covered (see the tool table in spec.md for what works with which wallet) |
+| Sui (mainnet, testnet, devnet; swaps on mainnet via Cetus) | ✅ Fully Covered |
 | Solana | 🔜 Soon |
 | Bitcoin | 🔜 Soon |
 
@@ -39,7 +39,7 @@ Preview a swap, compare routes through OpenOcean, and submit it. The wallet deco
   <img src="promo-images/02-best-price-swap.svg" alt="OpenOcean compares same-chain exchange quotes, selects the best quoted output, and submits the swap" width="860">
 </p>
 
-## Connect to any dapp
+## Connect to any dapp (Ethereum & Sui)
 
 Pair with Uniswap, OpenSea, Aave and more over WalletConnect v2. The agent reviews every proposal and request before anything is approved or signed.
 
@@ -57,7 +57,7 @@ Pair with Uniswap, OpenSea, Aave and more over WalletConnect v2. The agent revie
 - **Sui:** create or import Ed25519 wallets (the same 24-word phrases and `suiprivkey` keys as Slush and the Sui CLI), bound to mainnet, testnet or devnet, built on the official Sui Rust SDK. Send any coin, sign transactions and messages (Wallet Standard equivalents), and swap through the Cetus aggregator.
 - **Safe transactions:** estimate fees, simulate before signing, decode approvals, and revoke them when finished.
 - **Token swaps:** quotes and swaps through OpenOcean (Ethereum) and Cetus (Sui), with local verification and slippage protection.
-- **WalletConnect v2:** connect to any dapp, review the expected outcome of each request, then approve or reject it.
+- **WalletConnect v2:** connect to any dapp (Ethereum or Sui), review the expected outcome of each request, then approve or reject it.
 - **No double payments:** signed transactions are recorded before broadcast, so a lost response is never paid twice.
 - **Minimal dependencies:** hashing, ABI, RLP, EIP-712, BIP32/39 and WalletConnect logic are implemented in-repo and tested against published vectors.
 - **Encrypted export:** back up a wallet as a ZIP protected with MetaMask's vault scheme.
@@ -100,3 +100,5 @@ Pending record: the pending-transaction folder was empty after both sends.
 agent-saifu is experimental software provided "as is", without warranty of any kind. It has not been independently audited. Use it at your own risk, and never with funds you cannot afford to lose.
 
 The author and contributors are not responsible or liable for any loss or damage of any kind, including but not limited to lost, stolen, or misdirected funds, lost or leaked seed phrases, private keys, or passwords, failed or incorrect transactions, bugs, or actions taken by AI agents using this software. You are solely responsible for backing up your seed phrases and keeping your passwords safe. This is not financial advice.
+
+Depending on what blockchain you use, there may be a small fee for swaps (usually far under 1%). This covers (but is not limited to) gas fees, DEX aggregator fees, and more.

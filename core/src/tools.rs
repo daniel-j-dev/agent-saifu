@@ -889,7 +889,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "wc_pair",
-            description: "Connect to a dapp with WalletConnect (EVM dapps and Ethereum wallets only: Sui dapps use the Wallet Standard, not WalletConnect; use sign_contract_transaction and sign_personal_message with a Sui wallet instead). Give it the connection URI the dapp shows (starts with \"wc:\"; the text behind its QR code). Waits for the dapp's session proposal and returns what the dapp is asking for. Nothing is connected until you call wc_approve_session. No wallet is unlocked.",
+            description: "Connect to a dapp with WalletConnect (Ethereum dapps with an Ethereum wallet, and Sui dapps with a Sui wallet; the Sui methods are sui_getAccounts, sui_signTransaction, sui_signAndExecuteTransaction and sui_signPersonalMessage). Give it the connection URI the dapp shows (starts with \"wc:\"; the text behind its QR code). Waits for the dapp's session proposal and returns what the dapp is asking for. Nothing is connected until you call wc_approve_session. No wallet is unlocked.",
             params: vec![
                 req(
                     "uri",
@@ -912,7 +912,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "wc_approve_session",
-            description: "Approve a dapp's connection proposal with an Ethereum wallet (Sui wallets are not supported over WalletConnect). This reveals the wallet's address to the dapp, so it needs the wallet name, the chain ID and the password. chain_id plus additional_chain_ids must cover every chain the dapp requires (see wc_list_proposals) and may only include chains the dapp asked for; the wallet must have a network for each. Only the methods this wallet supports are granted (transactions, personal_sign, typed data); eth_sign is never granted.",
+            description: "Approve a dapp's connection proposal with an Ethereum or a Sui wallet (wc_list_proposals shows which the dapp can use). This reveals the wallet's address to the dapp, so it needs the wallet name and the password. Sui wallets: omit chain_id and additional_chain_ids; the dapp is connected on the wallet's own network (e.g. sui:mainnet), which the dapp must accept, and the Sui methods it asked for are granted (sui_signTransaction, sui_signAndExecuteTransaction, sui_signPersonalMessage, and sui_getAccounts). Ethereum wallets: chain_id plus additional_chain_ids must cover every chain the dapp requires (see wc_list_proposals) and may only include chains the dapp asked for; the wallet must have a network for each. Only the methods this wallet supports are granted (transactions, personal_sign, typed data); eth_sign is never granted.",
             params: vec![
                 req(
                     "proposal_id",
@@ -920,7 +920,7 @@ fn definitions() -> Vec<Tool> {
                     "The proposal_id from wc_pair or wc_list_proposals.",
                 ),
                 wallet(),
-                chain_id(),
+                chain_id_for_eth(),
                 opt(
                     "additional_chain_ids",
                     Kind::TextList,
@@ -938,12 +938,20 @@ fn definitions() -> Vec<Tool> {
                             .map_err(|_| format!("'{c}' is not a valid chain ID"))
                     })
                     .collect::<Result<Vec<u64>, String>>()?;
+                let (name, password) = (a.str("wallet_name")?, a.str("password")?);
+                if s.chain_of(name, password)? == Blockchain::Sui {
+                    reject_chain_id_for_sui(a)?;
+                    if !extra.is_empty() {
+                        return Err("'additional_chain_ids' is for Ethereum wallets; a Sui wallet is bound to one network".to_string());
+                    }
+                    return s.wc_approve_session_sui(a.u64("proposal_id")?, name, password);
+                }
                 s.wc_approve_session(
                     a.u64("proposal_id")?,
-                    a.str("wallet_name")?,
-                    a.u64("chain_id")?,
+                    name,
+                    eth_chain_id(a)?,
                     &extra,
-                    a.str("password")?,
+                    password,
                 )
             },
         },
@@ -975,13 +983,13 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "wc_list_requests",
-            description: "List the requests connected dapps are waiting on: transactions to send or sign, messages and typed data to sign. Shows the dapp, method, chain and a summary. Use wc_review_request for the full costs and expected outcome. Requests expire after about 5 minutes.",
+            description: "List the requests connected dapps are waiting on: transactions to send or sign, messages and typed data to sign, and Sui account queries. Shows the dapp, method, chain and a summary. Use wc_review_request for the full costs and expected outcome. Requests expire after about 5 minutes.",
             params: vec![],
             handler: |s, _| s.wc_list_requests(),
         },
         Tool {
             name: "wc_review_request",
-            description: "Review a dapp request before answering it. Unlocks the wallet for this call. For transactions it dry-runs the transaction and reports whether it would succeed, what it sends or approves (token transfers and approvals are decoded), the network fee and whether the wallet can afford it. For messages and typed data it shows exactly what would be signed, with warnings. Signs and sends nothing.",
+            description: "Review a dapp request before answering it. Unlocks the wallet for this call. For transactions it dry-runs the transaction and reports whether it would succeed, what it sends or approves (token transfers and approvals are decoded), the network fee and whether the wallet can afford it. For messages and typed data it shows exactly what would be signed, with warnings. Signs and sends nothing. Sui wallets: omit chain_id; the dry run, decoded commands and balance changes are shown for sui_signTransaction and sui_signAndExecuteTransaction.",
             params: vec![
                 req(
                     "request_id",
@@ -989,21 +997,21 @@ fn definitions() -> Vec<Tool> {
                     "The request_id from wc_list_requests.",
                 ),
                 wallet(),
-                chain_id(),
+                chain_id_for_eth(),
                 password(),
             ],
             handler: |s, a| {
-                s.wc_review_request(
-                    a.u64("request_id")?,
-                    a.str("wallet_name")?,
-                    a.u64("chain_id")?,
-                    a.str("password")?,
-                )
+                let (name, password) = (a.str("wallet_name")?, a.str("password")?);
+                if s.chain_of(name, password)? == Blockchain::Sui {
+                    reject_chain_id_for_sui(a)?;
+                    return s.wc_review_request_sui(a.u64("request_id")?, name, password);
+                }
+                s.wc_review_request(a.u64("request_id")?, name, eth_chain_id(a)?, password)
             },
         },
         Tool {
             name: "wc_approve_request",
-            description: "Approve a dapp request: sign it and send the answer back to the dapp. eth_sendTransaction is signed AND BROADCAST (spends funds); eth_signTransaction only signs; personal_sign and typed data produce a signature. The wallet name must be the wallet the dapp is connected to, and chain_id must be the request's chain. Review the request first with wc_review_request. A transaction that would fail is not sent.",
+            description: "Approve a dapp request: sign it and send the answer back to the dapp. eth_sendTransaction is signed AND BROADCAST (spends funds); eth_signTransaction only signs; personal_sign and typed data produce a signature. The wallet name must be the wallet the dapp is connected to, and (Ethereum) chain_id must be the request's chain. Review the request first with wc_review_request. A transaction that would fail is not sent. Sui wallets: omit chain_id; sui_signTransaction returns {signature, transactionBytes}, sui_signAndExecuteTransaction signs AND SUBMITS and returns {digest}, sui_signPersonalMessage returns {signature}, and sui_getAccounts returns the wallet's address and public key. The request must be for the wallet's own network and name its address.",
             params: vec![
                 req(
                     "request_id",
@@ -1011,16 +1019,16 @@ fn definitions() -> Vec<Tool> {
                     "The request_id from wc_list_requests.",
                 ),
                 wallet(),
-                chain_id(),
+                chain_id_for_eth(),
                 password(),
             ],
             handler: |s, a| {
-                s.wc_approve_request(
-                    a.u64("request_id")?,
-                    a.str("wallet_name")?,
-                    a.u64("chain_id")?,
-                    a.str("password")?,
-                )
+                let (name, password) = (a.str("wallet_name")?, a.str("password")?);
+                if s.chain_of(name, password)? == Blockchain::Sui {
+                    reject_chain_id_for_sui(a)?;
+                    return s.wc_approve_request_sui(a.u64("request_id")?, name, password);
+                }
+                s.wc_approve_request(a.u64("request_id")?, name, eth_chain_id(a)?, password)
             },
         },
         Tool {
@@ -1548,7 +1556,7 @@ mod tests {
             "wc_approve_request",
             "wc_review_request",
         ] {
-            for required in ["wallet_name", "chain_id", "password"] {
+            for required in ["wallet_name", "password"] {
                 assert!(
                     find(name)
                         .params
@@ -1557,6 +1565,14 @@ mod tests {
                     "{name} must require {required}"
                 );
             }
+            // Optional because Sui wallets omit it; Ethereum wallets are required to give it.
+            assert!(
+                find(name)
+                    .params
+                    .iter()
+                    .any(|p| p.name == "chain_id" && !p.required),
+                "{name} takes an optional chain_id"
+            );
         }
         // Looking, connecting and declining never touch a wallet.
         for name in [

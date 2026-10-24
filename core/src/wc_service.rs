@@ -19,7 +19,7 @@ use crate::walletconnect::manager::{PendingRequest, Proposal, Session};
 use crate::walletconnect::namespaces::{self, DappMetadata, ProposalData, Requirements};
 use crate::walletconnect::now_secs;
 use crate::walletconnect::proto;
-use crate::walletconnect::requests::{self, Action, TxRequest};
+use crate::walletconnect::requests::{self, Action, SuiKind, TxRequest};
 
 pub const DEFAULT_PAIR_WAIT_SECS: u64 = 20;
 pub const MAX_PAIR_WAIT_SECS: u64 = 60;
@@ -50,30 +50,77 @@ fn requirements_value(r: &Requirements) -> Value {
 }
 
 /// What the agent needs to decide whether to connect; no address is involved.
+fn sui_requirements_value(r: &namespaces::SuiRequirements) -> Value {
+    Value::object(vec![
+        ("chains", strings(&r.chains)),
+        ("methods", strings(&r.methods)),
+        ("events", strings(&r.events)),
+    ])
+}
+
 pub fn proposal_value(proposal: &Proposal) -> Value {
     let data: &ProposalData = &proposal.data;
-    let problem = namespaces::plan_approval(data, &namespaces::all_chains(data)).err();
+    let asks_sui = !data.sui_required.is_empty() || !data.sui_optional.is_empty();
+    // A proposal can be connected to an Ethereum wallet, a Sui wallet, or neither.
+    let eth_problem = namespaces::plan_approval(data, &namespaces::all_chains(data)).err();
+    let sui_possible = asks_sui
+        && data
+            .sui_required
+            .chains
+            .iter()
+            .chain(&data.sui_optional.chains)
+            .any(|c| namespaces::plan_sui_approval(data, c).is_ok());
+    let sui_error = if asks_sui && !sui_possible {
+        data.sui_required
+            .chains
+            .first()
+            .or(data.sui_optional.chains.first())
+            .and_then(|c| namespaces::plan_sui_approval(data, c).err())
+    } else {
+        None
+    };
+    let can_connect = eth_problem.is_none() || sui_possible;
     let mut warnings = vec![DAPP_NOT_VERIFIED.to_string()];
-    if let Some(p) = &problem {
-        warnings.push(p.clone());
+    if !can_connect {
+        warnings.extend(eth_problem.clone());
+        warnings.extend(sui_error);
     }
-    Value::object(vec![
+    let mut connect_with = vec![];
+    if eth_problem.is_none() {
+        connect_with.push("Ethereum".to_string());
+    }
+    if sui_possible {
+        connect_with.push("Sui".to_string());
+    }
+    let mut pairs = vec![
         ("proposal_id", id_string(proposal.id)),
         ("dapp", data.dapp.to_value()),
         ("required", requirements_value(&data.required)),
         ("optional", requirements_value(&data.optional)),
-        ("can_connect", Value::Bool(problem.is_none())),
+    ];
+    if asks_sui {
+        pairs.push(("sui_required", sui_requirements_value(&data.sui_required)));
+        pairs.push(("sui_optional", sui_requirements_value(&data.sui_optional)));
+    }
+    pairs.extend(vec![
+        ("can_connect", Value::Bool(can_connect)),
+        ("can_connect_with", strings(&connect_with)),
         ("expires_in_seconds", seconds_left(proposal.expires_at)),
         ("warnings", strings(&warnings)),
-    ])
+    ]);
+    Value::object(pairs)
 }
 
 pub fn session_value(session: &Session) -> Value {
+    let chains = match &session.sui_chain {
+        Some(chain) => ("chains", strings(std::slice::from_ref(chain))),
+        None => ("chain_ids", chain_list(&session.chains)),
+    };
     Value::object(vec![
         ("session_topic", Value::str(&session.topic)),
         ("wallet", Value::str(&session.wallet)),
         ("dapp", session.dapp.to_value()),
-        ("chain_ids", chain_list(&session.chains)),
+        chains,
         ("methods", strings(&session.methods)),
         ("confirmed_by_dapp", Value::Bool(session.acknowledged)),
         ("expires_in_seconds", seconds_left(session.expires_at)),
@@ -121,6 +168,22 @@ fn action_details(action: &Action) -> (&'static str, Value) {
         }
         Action::PersonalSign { message, .. } => ("message", requests::describe_message(message)),
         Action::SignTypedData { data, .. } => ("typed_data", requests::describe_typed_data(data)),
+        Action::Sui(sui) => match sui.kind {
+            SuiKind::GetAccounts => ("accounts", Value::object(vec![])),
+            SuiKind::SignPersonalMessage => ("message", requests::describe_message(&sui.message)),
+            SuiKind::SignTransaction | SuiKind::SignAndExecute => (
+                "transaction",
+                Value::object(vec![(
+                    "transaction_digest",
+                    Value::String(
+                        sui.transaction
+                            .as_ref()
+                            .map(|t| crate::sui::tx::digest_of(t))
+                            .unwrap_or_default(),
+                    ),
+                )]),
+            ),
+        },
     }
 }
 
@@ -134,7 +197,10 @@ pub fn request_value(request: &PendingRequest, dapp: &DappMetadata) -> Value {
         ("dapp", dapp.to_value()),
         ("method", Value::str(&request.method)),
         ("kind", Value::str(kind)),
-        ("chain_id", num(request.chain_id)),
+        match &request.sui_chain {
+            Some(chain) => ("chain", Value::str(chain)),
+            None => ("chain_id", num(request.chain_id)),
+        },
         ("expires_in_seconds", seconds_left(request.expires_at)),
         ("details", details),
     ])
@@ -232,7 +298,7 @@ pub fn outcome_lines(
     lines
 }
 
-fn names_match(a: &str, b: &str) -> bool {
+pub(crate) fn names_match(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
@@ -263,7 +329,7 @@ fn intent_of(tx: &TxRequest) -> Result<TxIntent, String> {
 }
 
 impl WalletService {
-    fn wc_clone_request(
+    pub(crate) fn wc_clone_request(
         &self,
         request_id: u64,
     ) -> Result<(PendingRequest, SessionSummary), String> {
@@ -280,6 +346,7 @@ impl WalletService {
             session_topic: request.session_topic.clone(),
             method: request.method.clone(),
             chain_id: request.chain_id,
+            sui_chain: request.sui_chain.clone(),
             action: request.action.clone(),
             received_at: request.received_at,
             expires_at: request.expires_at,
@@ -296,6 +363,11 @@ impl WalletService {
         password: &str,
     ) -> Result<OpenRequest, String> {
         let (request, session) = self.wc_clone_request(request_id)?;
+        if request.sui_chain.is_some() {
+            return Err(
+                "this is a Sui request; use a Sui wallet and leave out chain_id".to_string(),
+            );
+        }
         if chain_id != request.chain_id {
             return Err(format!(
                 "this request is for chain ID {}, not {chain_id}",
@@ -312,10 +384,14 @@ impl WalletService {
         let (record, contents) = self.unlock(wallet, password)?;
         let network = Self::network_of(&contents, chain_id)?;
         let owner = contents.address()?;
-        if request.action.signer() != &owner {
+        let signer = request
+            .action
+            .signer()
+            .ok_or("this request is not an Ethereum request")?;
+        if signer != &owner {
             return Err(format!(
                 "the dapp asked {} to sign, but this wallet's address is {}; refusing",
-                to_checksum(request.action.signer()),
+                to_checksum(signer),
                 to_checksum(&owner)
             ));
         }
@@ -517,6 +593,7 @@ impl WalletService {
                     ),
                 ));
             }
+            Action::Sui(_) => return Err("this is a Sui request".to_string()),
             Action::PersonalSign { .. } => {
                 pairs.push(("details", details));
                 pairs.push((
@@ -616,6 +693,7 @@ impl WalletService {
                     .to_string();
                 (answer, sent)
             }
+            Action::Sui(_) => return Err("this is a Sui request".to_string()),
             Action::PersonalSign { message, .. } => {
                 let signature = sign::sign_personal_message(&key.0, message)?;
                 let hex_sig = hex::encode_prefixed(&signature);
@@ -680,9 +758,9 @@ impl WalletService {
     }
 }
 
-struct SessionSummary {
-    wallet: String,
-    dapp: DappMetadata,
+pub(crate) struct SessionSummary {
+    pub wallet: String,
+    pub dapp: DappMetadata,
 }
 
 fn clone_session_summary(session: &Session) -> SessionSummary {

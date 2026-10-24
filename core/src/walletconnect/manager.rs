@@ -63,6 +63,8 @@ pub struct Session {
     key: SymKey,
     pub wallet: String,
     pub chains: Vec<u64>,
+    /// The Sui chain (`sui:mainnet`) of a Sui session; such a session has no EVM chains.
+    pub sui_chain: Option<String>,
     pub methods: Vec<String>,
     pub dapp: DappMetadata,
     pub created_at: u64,
@@ -76,10 +78,22 @@ pub struct PendingRequest {
     pub id: u64,
     pub session_topic: String,
     pub method: String,
+    /// The EVM chain ID, or 0 for a Sui request.
     pub chain_id: u64,
+    pub sui_chain: Option<String>,
     pub action: Action,
     pub received_at: u64,
     pub expires_at: u64,
+}
+
+/// What a session grants, already in the form `wc_sessionSettle` carries it.
+pub struct SessionTerms {
+    pub namespaces: Value,
+    /// `sessionProperties`, a string-to-string map (Sui puts `sui_getAccounts` here).
+    pub properties: Option<Value>,
+    pub chains: Vec<u64>,
+    pub sui_chain: Option<String>,
+    pub methods: Vec<String>,
 }
 
 pub struct PairOutcome {
@@ -331,7 +345,11 @@ impl WcManager {
         let Some(session) = self.sessions.iter().find(|s| s.topic == topic) else {
             return;
         };
-        let (session_chains, session_methods) = (session.chains.clone(), session.methods.clone());
+        let (session_chains, session_sui, session_methods) = (
+            session.chains.clone(),
+            session.sui_chain.clone(),
+            session.methods.clone(),
+        );
         let now = now_secs();
         match method {
             proto::METHOD_REQUEST => {}
@@ -368,12 +386,20 @@ impl WcManager {
         ) else {
             return respond_error(self, proto::INVALID_REQUEST, "Malformed request");
         };
-        let Ok(chain_id) = namespaces::parse_chain_reference(chain_text) else {
-            return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
+        let (chain_id, sui_chain) = if let Some(sui) = &session_sui {
+            if chain_text != sui {
+                return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
+            }
+            (0, Some(sui.clone()))
+        } else {
+            let Ok(chain_id) = namespaces::parse_chain_reference(chain_text) else {
+                return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
+            };
+            if !session_chains.contains(&chain_id) {
+                return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
+            }
+            (chain_id, None)
         };
-        if !session_chains.contains(&chain_id) {
-            return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
-        }
         if !session_methods.iter().any(|m| m == request_method) {
             return respond_error(self, proto::UNAUTHORIZED_METHOD, "Unauthorized method");
         }
@@ -395,6 +421,7 @@ impl WcManager {
                 session_topic: topic.to_string(),
                 method: request_method.to_string(),
                 chain_id,
+                sui_chain,
                 action,
                 received_at: now,
                 expires_at,
@@ -492,6 +519,26 @@ impl WcManager {
         address: &Address,
         approval: &Approval,
     ) -> Result<ApprovedSession, String> {
+        self.approve_session_with(
+            proposal_id,
+            wallet,
+            SessionTerms {
+                namespaces: namespaces::settle_namespaces(approval, address),
+                properties: None,
+                chains: approval.chains.clone(),
+                sui_chain: None,
+                methods: approval.methods.clone(),
+            },
+        )
+    }
+
+    /// Like `approve_session`, for terms the caller has already worked out (Ethereum or Sui).
+    pub fn approve_session_with(
+        &mut self,
+        proposal_id: u64,
+        wallet: &str,
+        terms: SessionTerms,
+    ) -> Result<ApprovedSession, String> {
         if self.sessions.len() >= MAX_SESSIONS {
             return Err("too many open sessions; disconnect one first".to_string());
         }
@@ -514,30 +561,33 @@ impl WcManager {
         let topic = envelope::topic_of(&session_key);
         let now = now_secs();
         let settle_id = proto::new_message_id()?;
+        let mut settle_params = vec![
+            (
+                "relay",
+                Value::object(vec![("protocol", Value::str("irn"))]),
+            ),
+            ("namespaces", terms.namespaces.clone()),
+        ];
+        if let Some(properties) = &terms.properties {
+            settle_params.push(("sessionProperties", properties.clone()));
+        }
+        settle_params.extend(vec![
+            (
+                "controller",
+                Value::object(vec![
+                    ("publicKey", Value::String(hex::encode(&own.public))),
+                    ("metadata", controller_metadata()),
+                ]),
+            ),
+            (
+                "expiry",
+                Value::Number((now + SESSION_LIFETIME_SECS).to_string()),
+            ),
+        ]);
         let settle = proto::build_request(
             settle_id,
             proto::METHOD_SETTLE,
-            Value::object(vec![
-                (
-                    "relay",
-                    Value::object(vec![("protocol", Value::str("irn"))]),
-                ),
-                (
-                    "namespaces",
-                    namespaces::settle_namespaces(approval, address),
-                ),
-                (
-                    "controller",
-                    Value::object(vec![
-                        ("publicKey", Value::String(hex::encode(&own.public))),
-                        ("metadata", controller_metadata()),
-                    ]),
-                ),
-                (
-                    "expiry",
-                    Value::Number((now + SESSION_LIFETIME_SECS).to_string()),
-                ),
-            ]),
+            Value::object(settle_params),
         );
         let answer = proto::build_result(
             &id_value(proposal.id),
@@ -580,8 +630,9 @@ impl WcManager {
             topic: topic.clone(),
             key: SymKey(session_key),
             wallet: wallet.to_string(),
-            chains: approval.chains.clone(),
-            methods: approval.methods.clone(),
+            chains: terms.chains.clone(),
+            sui_chain: terms.sui_chain.clone(),
+            methods: terms.methods.clone(),
             dapp,
             created_at: now,
             expires_at: now + SESSION_LIFETIME_SECS,

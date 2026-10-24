@@ -558,7 +558,10 @@ impl WalletService {
 
     // ---- signing arbitrary transactions and messages ----------------------------------------------
 
-    fn sui_check_chain(transaction: &Transaction, s: &Session<'_>) -> Result<(), String> {
+    pub(super) fn sui_check_chain(
+        transaction: &Transaction,
+        s: &Session<'_>,
+    ) -> Result<(), String> {
         if let TransactionExpiration::ValidDuring { chain, .. } = &transaction.expiration
             && chain.to_string() != s.chain
         {

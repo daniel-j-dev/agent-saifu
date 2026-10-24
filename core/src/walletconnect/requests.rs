@@ -14,6 +14,11 @@ pub const METHOD_PERSONAL_SIGN: &str = "personal_sign";
 pub const METHOD_TYPED_DATA: &str = "eth_signTypedData";
 pub const METHOD_TYPED_DATA_V4: &str = "eth_signTypedData_v4";
 
+pub const METHOD_SUI_GET_ACCOUNTS: &str = "sui_getAccounts";
+pub const METHOD_SUI_SIGN_TRANSACTION: &str = "sui_signTransaction";
+pub const METHOD_SUI_SIGN_AND_EXECUTE: &str = "sui_signAndExecuteTransaction";
+pub const METHOD_SUI_PERSONAL_MESSAGE: &str = "sui_signPersonalMessage";
+
 const MAX_CALL_DATA: usize = 128 * 1024;
 const MAX_TEXT_PREVIEW: usize = 2000;
 const MAX_VALUE_TEXT: usize = 200;
@@ -31,8 +36,29 @@ pub struct TxRequest {
     pub chain_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuiKind {
+    GetAccounts,
+    SignTransaction,
+    SignAndExecute,
+    SignPersonalMessage,
+}
+
+/// A Sui request. `address` is what the dapp believes the signer is; it is `None` only for
+/// `sui_getAccounts`, which carries no parameters.
+#[derive(Debug, Clone)]
+pub struct SuiRequest {
+    pub kind: SuiKind,
+    pub address: Option<sui_sdk_types::Address>,
+    /// The transaction for the two transaction kinds, decoded from base64 BCS `TransactionData`.
+    pub transaction: Option<Box<sui_sdk_types::Transaction>>,
+    /// The personal message, taken as UTF-8 text.
+    pub message: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
+    Sui(SuiRequest),
     SendTransaction(TxRequest),
     SignTransaction(TxRequest),
     PersonalSign {
@@ -46,11 +72,13 @@ pub enum Action {
 }
 
 impl Action {
-    pub fn signer(&self) -> &Address {
-        match self {
+    /// The Ethereum signer the dapp named; `None` for Sui requests.
+    pub fn signer(&self) -> Option<&Address> {
+        Some(match self {
+            Action::Sui(_) => return None,
             Action::SendTransaction(tx) | Action::SignTransaction(tx) => &tx.from,
             Action::PersonalSign { address, .. } | Action::SignTypedData { address, .. } => address,
-        }
+        })
     }
 }
 
@@ -187,6 +215,57 @@ fn parse_typed(method: &str, params: &Value) -> Result<Action, String> {
     })
 }
 
+/// Sui parameters are an object `{transaction | message, address}`; a one-element list holding
+/// that object is tolerated.
+fn parse_sui(method: &str, params: &Value) -> Result<Action, String> {
+    let object = match params {
+        Value::Array(list) if list.len() == 1 => &list[0],
+        other => other,
+    };
+    let text = |key: &str| object.get(key).and_then(Value::as_str);
+    let kind = match method {
+        METHOD_SUI_GET_ACCOUNTS => {
+            return Ok(Action::Sui(SuiRequest {
+                kind: SuiKind::GetAccounts,
+                address: None,
+                transaction: None,
+                message: vec![],
+            }));
+        }
+        METHOD_SUI_SIGN_TRANSACTION => SuiKind::SignTransaction,
+        METHOD_SUI_SIGN_AND_EXECUTE => SuiKind::SignAndExecute,
+        _ => SuiKind::SignPersonalMessage,
+    };
+    if !matches!(object, Value::Object(_)) {
+        return Err(format!("{method} parameters must be an object"));
+    }
+    let address = crate::sui::coins::parse_address(
+        text("address").ok_or_else(|| format!("{method} needs the signer 'address'"))?,
+    )
+    .map_err(|e| format!("signer address: {e}"))?;
+    if kind == SuiKind::SignPersonalMessage {
+        let message = text("message").ok_or("sui_signPersonalMessage needs a 'message'")?;
+        if message.len() > crate::sui::tx::MAX_MESSAGE_BYTES {
+            return Err("the message is too large".to_string());
+        }
+        return Ok(Action::Sui(SuiRequest {
+            kind,
+            address: Some(address),
+            transaction: None,
+            message: message.as_bytes().to_vec(),
+        }));
+    }
+    let transaction = crate::sui::tx::decode(
+        text("transaction").ok_or_else(|| format!("{method} needs the 'transaction'"))?,
+    )?;
+    Ok(Action::Sui(SuiRequest {
+        kind,
+        address: Some(address),
+        transaction: Some(Box::new(transaction)),
+        message: vec![],
+    }))
+}
+
 pub fn parse_request(method: &str, params: &Value) -> Result<Action, String> {
     match method {
         METHOD_SEND_TRANSACTION | METHOD_SIGN_TRANSACTION => {
@@ -198,6 +277,10 @@ pub fn parse_request(method: &str, params: &Value) -> Result<Action, String> {
                 Action::SignTransaction(tx)
             })
         }
+        METHOD_SUI_GET_ACCOUNTS
+        | METHOD_SUI_SIGN_TRANSACTION
+        | METHOD_SUI_SIGN_AND_EXECUTE
+        | METHOD_SUI_PERSONAL_MESSAGE => parse_sui(method, params),
         METHOD_PERSONAL_SIGN => parse_personal_sign(params),
         METHOD_TYPED_DATA | METHOD_TYPED_DATA_V4 => parse_typed(method, params),
         other => Err(format!(
@@ -487,7 +570,7 @@ mod tests {
             panic!()
         };
         let a = parse("personal_sign", &format!(r#"["0x00","{YOU}"]"#)).unwrap();
-        assert_eq!(a.signer(), &parse_address(YOU).unwrap());
+        assert_eq!(a.signer(), Some(&parse_address(YOU).unwrap()));
     }
 
     #[test]

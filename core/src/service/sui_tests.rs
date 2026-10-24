@@ -2202,3 +2202,5 @@ fn passwords_and_secrets_never_appear_in_sui_output_or_errors() {
         assert!(!out.contains(&key_hex()), "{out}");
     }
 }
+
+mod wc;

@@ -34,6 +34,7 @@ mod sui;
 mod sui_swap;
 #[cfg(test)]
 mod sui_tests;
+mod sui_wc;
 
 pub const MAX_FAILED_ATTEMPTS: u32 = 5;
 pub const LOCKOUT: Duration = Duration::from_secs(60);

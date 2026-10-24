@@ -13,7 +13,8 @@
 /// While this is left empty (`""`) NO fee is charged and swaps still work.
 /// An address that is not valid makes the server refuse to start (with a clear message on
 /// stderr) instead of sending fees somewhere unexpected.
-pub const SUI_SWAP_FEE_RECIPIENT: &str = "0x7744b1acf734218f054a556b56cfd6d7234f2798cccc621f5620a3173e0cd5a2";
+pub const SUI_SWAP_FEE_RECIPIENT: &str =
+    "0x7744b1acf734218f054a556b56cfd6d7234f2798cccc621f5620a3173e0cd5a2";
 
 /// Fee in basis points of the amount the swap produces. 70 bps = 0.7%. The aggregator's contract
 /// accepts 1 to 1000 bps (0.01% to 10%).
