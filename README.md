@@ -75,9 +75,10 @@ Pair with Uniswap, OpenSea, Aave and more over WalletConnect v2. The agent revie
 See [**spec.md**](spec.md) for every tool, the full security design, setup instructions, and worked examples. Agents and humans alike should start there.
 
 1. Download the latest [release](https://github.com/daniel-j-dev/agent-saifu/releases) and extract it. 
-2. After, ask your agents create a wallet, show your balance, send, swap & more. 
+2. Ask your agent to read the `spec.md` file (in the release zip files)
+3. After, ask your agents create a wallet, show your balance, send, swap & more. 
 
-Problems? If your agent is confused about anything, tell it to read the `spec.md` file for context. This is included in the release zip files.
+Problems? If your agent is confused about anything, remind it to read the `spec.md` file for context. This is included in the release zip files.
 
 ### Example chat
 
