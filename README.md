@@ -9,6 +9,8 @@ Built from the ground up in Rust. Driven entirely through MCP.
 
 <br>
 
+<div align="center">
+
 ## Blockchain coverage
 
 | Blockchain | Status |
@@ -18,6 +20,11 @@ Built from the ground up in Rust. Driven entirely through MCP.
 | Sui (mainnet, testnet, devnet; swaps on mainnet via Cetus) | ✅ Fully Covered |
 | Solana | 🔜 Soon |
 | Bitcoin | 🔜 Soon |
+
+<br>
+
+
+</div>
 
 <p align="center">
   <img src="promo-images/03-mcp-tools.svg" alt="An agent calls MCP tools such as get_wallet_balances, get_swap_quote, simulate_transaction and swap_tokens and receives structured results" width="860">
