@@ -71,8 +71,10 @@ Complete the following:
 
 After, ask your agents create a wallet, show your balance, send, swap & more (a few examples below). 
 
+<br>
+
 > [!NOTE]
-> If you want the codebase instead of the faster compiled release, feel free to clone the repo instead. Agents can still use the full MCP functionality - just tell them to read the `SKILL.md` and `spec.md` files.
+> If you want to use the codebase instead of the faster compiled release, feel free to clone the repo instead. Agents can still use the full MCP functionality - just tell them to read the `SKILL.md` and `spec.md` files.
 
 
 ### Example prompts for your agent
