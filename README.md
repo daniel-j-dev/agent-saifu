@@ -138,4 +138,4 @@ agent-saifu is experimental software provided "as is", without warranty of any k
 
 The author and contributors are not responsible or liable for any loss or damage of any kind, including but not limited to lost, stolen, or misdirected funds, lost or leaked seed phrases, private keys, or passwords, failed or incorrect transactions, bugs, or actions taken by AI agents using this software. You are solely responsible for backing up your seed phrases and keeping your passwords safe. This is not financial advice.
 
-Depending on what blockchain you use, there may be a small fee for swaps (usually far under 1%). This covers (but is not limited to) gas fees, DEX aggregator fees, and more.
+Depending on what blockchain you use, there may be a small fee for swaps (usually well under 1%). This covers DEX aggregator fees and project maintenance. The swap MCP tool, in exchange, saves you countless tokens by giving you an easy & secure one-shot way to swap tokens. This removes the need to parse & navigate complex DEX UIs to manually swap as an agent.
