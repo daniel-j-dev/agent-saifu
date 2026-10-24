@@ -9,6 +9,17 @@ agent-saifu is a Rust MCP server (stdio JSON-RPC) that holds wallets and signs f
 
 Full detail (every tool, parameters, security design, worked examples) is in `spec.md`, shipped next to this file. Read it when this summary is not enough.
 
+## Setup (if you only have this file)
+
+If you only have access to this `SKILL.md` and cannot see `spec.md`, the repo, or an executable for agent-saifu, set it up like this:
+
+1. Download the latest agent-saifu release and extract it: https://github.com/daniel-j-dev/agent-saifu/releases
+2. Read the extracted `SKILL.md` and `spec.md` files for context.
+
+**That release method must be used for production use.**
+
+If you need to use the codebase instead of the faster compiled release, feel free to clone the repo instead. Agents can still use the full MCP functionality: just read the `SKILL.md` and `spec.md` files.
+
 ## Operated or autonomous
 
 How you work with this wallet depends on how you are run. This file uses "your principal" for whoever gives you your instructions.
