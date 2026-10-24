@@ -54,31 +54,40 @@ Pair with Uniswap, OpenSea, Aave and more over WalletConnect v2. The agent revie
   <img src="promo-images/04-walletconnect.svg" alt="The agent pairs with a browser dapp using wc_pair, reviews the proposal and approves the session with wc_approve_session" width="860">
 </p>
 
-## Features
-
-- **Agent-native:** every capability is an MCP tool over stdio JSON-RPC, with structured results.
-- **Vaults you can trust:** MetaMask-compatible encryption (PBKDF2-HMAC-SHA256 and AES-256-GCM) with 24-word BIP39 seed phrases.
-- **Per-action unlock:** one wallet at a time, locked again after every call. Addresses and balances stay hidden until unlocked.
-- **Multiple wallets:** create or import wallets, each with its own password, networks and tokens.
-- **Ethereum and layer 2s:** add custom networks per wallet and check balances across all of them, with USDC values.
-- **Sui:** create or import Ed25519 wallets (the same 24-word phrases and `suiprivkey` keys as Slush and the Sui CLI), bound to mainnet, testnet or devnet, built on the official Sui Rust SDK. Send any coin, sign transactions and messages (Wallet Standard equivalents), and swap through the Cetus aggregator.
-- **Safe transactions:** estimate fees, simulate before signing, decode approvals, and revoke them when finished.
-- **Token swaps:** quotes and swaps through OpenOcean (Ethereum) and Cetus (Sui), with local verification and slippage protection.
-- **WalletConnect v2:** connect to any dapp (Ethereum or Sui), review the expected outcome of each request, then approve or reject it.
-- **No double payments:** signed transactions are recorded before broadcast, so a lost response is never paid twice.
-- **Minimal dependencies:** hashing, ABI, RLP, EIP-712, BIP32/39 and WalletConnect logic are implemented in-repo and tested against published vectors.
-- **Encrypted export:** back up a wallet as a ZIP protected with MetaMask's vault scheme.
-
 
 ## Setup + Learn more
 
-See [**spec.md**](spec.md) for every tool, the full security design, setup instructions, and worked examples. Agents and humans alike should start there.
+See [**spec.md**](spec.md) for every tool, the full security design, setup instructions, and worked examples. Agents and humans alike should start there. Always use the latest [release](https://github.com/daniel-j-dev/agent-saifu/releases) or main branch commit.
 
-1. Download the latest [release](https://github.com/daniel-j-dev/agent-saifu/releases) and extract it. 
-2. Ask your agent to read the `spec.md` file (in the release zip files)
-3. After, ask your agents create a wallet, show your balance, send, swap & more. 
+To setup the latest version, just send this to your agent:
 
-Problems? If your agent is confused about anything, remind it to read the `spec.md` file for context. This is included in the release zip files.
+```
+Complete the following:
+- Download the latest agent-saifu release here & extract it: https://github.com/daniel-j-dev/agent-saifu/releases
+- Read the extracted `SKILL.md` and `spec.md` files for context
+```
+
+
+
+After, ask your agents create a wallet, show your balance, send, swap & more (a few examples below). 
+
+> [!NOTE]
+> If you want the codebase instead of the faster compiled release, feel free to clone the repo instead. Agents can still use the full MCP functionality - just tell them to read the `SKILL.md` and `spec.md` files.
+
+
+### Example prompts for your agent
+- `List all my wallets`
+- `Create a new Sui wallet called Demo with the password demo-password-123`
+- `Check the Demo wallet's balance`
+- `Add the USDC token to Demo`
+- `I gave it some USDC. Send 20 USDC here: 0x0ee53b569620c2f9608c0...`
+-  `Connect to this dapp: wc:4ee067614de2f533c...` (walletconnect link)
+- `Approve the Cetus transaction`
+- `Export a backup of my Demo wallet`
+
+Layer 2 examples (ETH wallets only)
+- `Add the Arbitrum network to the eth wallet`
+- `Send 20 USDC on arbitrum from my eth wallet to 0xc2F69890A...`
 
 ### Example chat
 
@@ -102,6 +111,24 @@ ETH: 0.002319996 ETH. Transaction 0x6bbd…470c.
 What's left in Demo: about 0.0000012 ETH, which is 1,171,052,026,000 wei. I couldn't send exactly everything because a transfer needs gas. I held back about 0.0000016 ETH so a fee swing wouldn't make the send fail, and the actual fee came to less.
 Pending record: the pending-transaction folder was empty after both sends.
 ```
+
+<br>
+Having problems? If your agent is confused about anything, remind it to read the `SKILL.md` and `spec.md` files for context. This is included in the release zip files.
+
+## Features
+
+- **Agent-native:** every capability is an MCP tool over stdio JSON-RPC, with structured results.
+- **Vaults you can trust:** MetaMask-compatible encryption (PBKDF2-HMAC-SHA256 and AES-256-GCM) with 24-word BIP39 seed phrases.
+- **Per-action unlock:** one wallet at a time, locked again after every call. Addresses and balances stay hidden until unlocked.
+- **Multiple wallets:** create or import wallets, each with its own password, networks and tokens.
+- **Ethereum and layer 2s:** add custom networks per wallet and check balances across all of them, with USDC values.
+- **Sui:** create or import Ed25519 wallets (the same 24-word phrases and `suiprivkey` keys as Slush and the Sui CLI), bound to mainnet, testnet or devnet, built on the official Sui Rust SDK. Send any coin, sign transactions and messages (Wallet Standard equivalents), and swap through the Cetus aggregator.
+- **Safe transactions:** estimate fees, simulate before signing, decode approvals, and revoke them when finished.
+- **Token swaps:** quotes and swaps through OpenOcean (Ethereum) and Cetus (Sui), with local verification and slippage protection.
+- **WalletConnect v2:** connect to any dapp (Ethereum or Sui), review the expected outcome of each request, then approve or reject it.
+- **No double payments:** signed transactions are recorded before broadcast, so a lost response is never paid twice.
+- **Minimal dependencies:** hashing, ABI, RLP, EIP-712, BIP32/39 and WalletConnect logic are implemented in-repo and tested against published vectors.
+- **Encrypted export:** back up a wallet as a ZIP protected with MetaMask's vault scheme.
 
 ## Disclaimer
 

@@ -49,13 +49,13 @@ jobs:
         working-directory: core
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package zip (executable + spec.md)
+      - name: Package zip (executable + spec.md + SKILL.md)
         shell: bash
         run: |
           out="agent-saifu-${{ matrix.name }}"
           mkdir "$out"
           cp "core/target/${{ matrix.target }}/release/${{ matrix.binary }}" "$out/"
-          cp spec.md "$out/"
+          cp spec.md SKILL.md "$out/"
           if [ "${{ matrix.name }}" = "windows" ]; then
             7z a -tzip "$out.zip" "./$out/*"
           else
