@@ -57,7 +57,7 @@ Pair with Uniswap, OpenSea, Aave and more over WalletConnect v2. The agent revie
 
 ## Setup + Learn more
 
-See [**spec.md**](spec.md) for every tool, the full security design, setup instructions, and worked examples. Agents and humans alike should start there. Always use the latest [release](https://github.com/daniel-j-dev/agent-saifu/releases) or main branch commit.
+
 
 To setup the latest version, just send this to your agent:
 
@@ -116,6 +116,10 @@ Pending record: the pending-transaction folder was empty after both sends.
 
 <br>
 Having problems? If your agent is confused about anything, remind it to read the `SKILL.md` and `spec.md` files for context. This is included in the release zip files.
+
+<br>
+
+See [**spec.md**](spec.md) for every tool, the full security design, setup instructions, and worked examples. Agents and humans alike should start there. Always use the latest [release](https://github.com/daniel-j-dev/agent-saifu/releases) or main branch commit.
 
 ## Features
 
