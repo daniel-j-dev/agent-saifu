@@ -15,11 +15,12 @@ use crate::eth::sign;
 use crate::eth::u256::U256;
 use crate::json::Value;
 use crate::service::WalletService;
+use crate::solana::network::SolanaNetwork;
 use crate::walletconnect::manager::{PendingRequest, Proposal, Session};
 use crate::walletconnect::namespaces::{self, DappMetadata, ProposalData, Requirements};
 use crate::walletconnect::now_secs;
 use crate::walletconnect::proto;
-use crate::walletconnect::requests::{self, Action, SuiKind, TxRequest};
+use crate::walletconnect::requests::{self, Action, SolanaKind, SuiKind, TxRequest};
 
 pub const DEFAULT_PAIR_WAIT_SECS: u64 = 20;
 pub const MAX_PAIR_WAIT_SECS: u64 = 60;
@@ -61,7 +62,8 @@ fn sui_requirements_value(r: &namespaces::SuiRequirements) -> Value {
 pub fn proposal_value(proposal: &Proposal) -> Value {
     let data: &ProposalData = &proposal.data;
     let asks_sui = !data.sui_required.is_empty() || !data.sui_optional.is_empty();
-    // A proposal can be connected to an Ethereum wallet, a Sui wallet, or neither.
+    let asks_solana = !data.solana_required.is_empty() || !data.solana_optional.is_empty();
+    // A proposal can be connected to an Ethereum wallet, a Sui wallet, a Solana wallet, or none.
     let eth_problem = namespaces::plan_approval(data, &namespaces::all_chains(data)).err();
     let sui_possible = asks_sui
         && data
@@ -79,11 +81,33 @@ pub fn proposal_value(proposal: &Proposal) -> Value {
     } else {
         None
     };
-    let can_connect = eth_problem.is_none() || sui_possible;
+    let solana_clusters: Vec<SolanaNetwork> = [
+        SolanaNetwork::Mainnet,
+        SolanaNetwork::Devnet,
+        SolanaNetwork::Testnet,
+    ]
+    .into_iter()
+    .filter(|n| asks_solana && namespaces::plan_solana_approval(data, *n).is_ok())
+    .collect();
+    let solana_possible = !solana_clusters.is_empty();
+    let solana_error = if asks_solana && !solana_possible {
+        let cluster = data
+            .solana_required
+            .chains
+            .iter()
+            .chain(&data.solana_optional.chains)
+            .find_map(|c| SolanaNetwork::from_chain(c))
+            .unwrap_or(SolanaNetwork::Mainnet);
+        namespaces::plan_solana_approval(data, cluster).err()
+    } else {
+        None
+    };
+    let can_connect = eth_problem.is_none() || sui_possible || solana_possible;
     let mut warnings = vec![DAPP_NOT_VERIFIED.to_string()];
     if !can_connect {
         warnings.extend(eth_problem.clone());
         warnings.extend(sui_error);
+        warnings.extend(solana_error);
     }
     let mut connect_with = vec![];
     if eth_problem.is_none() {
@@ -91,6 +115,16 @@ pub fn proposal_value(proposal: &Proposal) -> Value {
     }
     if sui_possible {
         connect_with.push("Sui".to_string());
+    }
+    if solana_possible {
+        connect_with.push(format!(
+            "Solana ({})",
+            solana_clusters
+                .iter()
+                .map(|n| n.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     let mut pairs = vec![
         ("proposal_id", id_string(proposal.id)),
@@ -102,6 +136,16 @@ pub fn proposal_value(proposal: &Proposal) -> Value {
         pairs.push(("sui_required", sui_requirements_value(&data.sui_required)));
         pairs.push(("sui_optional", sui_requirements_value(&data.sui_optional)));
     }
+    if asks_solana {
+        pairs.push((
+            "solana_required",
+            sui_requirements_value(&data.solana_required),
+        ));
+        pairs.push((
+            "solana_optional",
+            sui_requirements_value(&data.solana_optional),
+        ));
+    }
     pairs.extend(vec![
         ("can_connect", Value::Bool(can_connect)),
         ("can_connect_with", strings(&connect_with)),
@@ -112,9 +156,10 @@ pub fn proposal_value(proposal: &Proposal) -> Value {
 }
 
 pub fn session_value(session: &Session) -> Value {
-    let chains = match &session.sui_chain {
-        Some(chain) => ("chains", strings(std::slice::from_ref(chain))),
-        None => ("chain_ids", chain_list(&session.chains)),
+    let chains = match (&session.sui_chain, session.solana_chains.is_empty()) {
+        (Some(chain), _) => ("chains", strings(std::slice::from_ref(chain))),
+        (None, false) => ("chains", strings(&session.solana_chains)),
+        (None, true) => ("chain_ids", chain_list(&session.chains)),
     };
     Value::object(vec![
         ("session_topic", Value::str(&session.topic)),
@@ -184,6 +229,26 @@ fn action_details(action: &Action) -> (&'static str, Value) {
                 )]),
             ),
         },
+        Action::Solana(solana) => match solana.kind {
+            SolanaKind::GetAccounts => ("accounts", Value::object(vec![])),
+            SolanaKind::SignMessage => ("message", requests::describe_message(&solana.message)),
+            SolanaKind::SignTransaction | SolanaKind::SignAndSend | SolanaKind::SignAll => (
+                "transaction",
+                Value::object(vec![
+                    ("transaction_count", num(solana.transactions.len() as u64)),
+                    (
+                        "instruction_counts",
+                        Value::Array(
+                            solana
+                                .transactions
+                                .iter()
+                                .map(|t| num(t.message.instructions.len() as u64))
+                                .collect(),
+                        ),
+                    ),
+                ]),
+            ),
+        },
     }
 }
 
@@ -199,7 +264,10 @@ pub fn request_value(request: &PendingRequest, dapp: &DappMetadata) -> Value {
         ("kind", Value::str(kind)),
         match &request.sui_chain {
             Some(chain) => ("chain", Value::str(chain)),
-            None => ("chain_id", num(request.chain_id)),
+            None => match &request.solana_chain {
+                Some(chain) => ("chain", Value::str(chain)),
+                None => ("chain_id", num(request.chain_id)),
+            },
         },
         ("expires_in_seconds", seconds_left(request.expires_at)),
         ("details", details),
@@ -347,6 +415,7 @@ impl WalletService {
             method: request.method.clone(),
             chain_id: request.chain_id,
             sui_chain: request.sui_chain.clone(),
+            solana_chain: request.solana_chain.clone(),
             action: request.action.clone(),
             received_at: request.received_at,
             expires_at: request.expires_at,
@@ -366,6 +435,11 @@ impl WalletService {
         if request.sui_chain.is_some() {
             return Err(
                 "this is a Sui request; use a Sui wallet and leave out chain_id".to_string(),
+            );
+        }
+        if request.solana_chain.is_some() {
+            return Err(
+                "this is a Solana request; use a Solana wallet and leave out chain_id".to_string(),
             );
         }
         if chain_id != request.chain_id {
@@ -593,7 +667,9 @@ impl WalletService {
                     ),
                 ));
             }
-            Action::Sui(_) => return Err("this is a Sui request".to_string()),
+            Action::Sui(_) | Action::Solana(_) => {
+                return Err("this is not an Ethereum request".to_string());
+            }
             Action::PersonalSign { .. } => {
                 pairs.push(("details", details));
                 pairs.push((
@@ -693,7 +769,9 @@ impl WalletService {
                     .to_string();
                 (answer, sent)
             }
-            Action::Sui(_) => return Err("this is a Sui request".to_string()),
+            Action::Sui(_) | Action::Solana(_) => {
+                return Err("this is not an Ethereum request".to_string());
+            }
             Action::PersonalSign { message, .. } => {
                 let signature = sign::sign_personal_message(&key.0, message)?;
                 let hex_sig = hex::encode_prefixed(&signature);

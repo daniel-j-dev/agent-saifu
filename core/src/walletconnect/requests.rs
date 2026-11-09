@@ -1,12 +1,16 @@
 //! Turns the raw `wc_sessionRequest` payloads into typed actions and reviewable descriptions.
 
-use crate::crypto::hex;
+use crate::crypto::{base58, hex};
 use crate::eth::address::{Address, parse_address};
 use crate::eth::explorer::sanitize_text_max;
 use crate::eth::sign::MAX_MESSAGE_BYTES;
 use crate::eth::typed_data::{self, TypedData};
 use crate::eth::u256::U256;
 use crate::json::Value;
+use crate::solana::address::{self as solana_address, Pubkey};
+use crate::solana::tx::{
+    self as solana_tx, AccountMeta, Instruction, Transaction as SolanaTransaction,
+};
 
 pub const METHOD_SEND_TRANSACTION: &str = "eth_sendTransaction";
 pub const METHOD_SIGN_TRANSACTION: &str = "eth_signTransaction";
@@ -18,6 +22,18 @@ pub const METHOD_SUI_GET_ACCOUNTS: &str = "sui_getAccounts";
 pub const METHOD_SUI_SIGN_TRANSACTION: &str = "sui_signTransaction";
 pub const METHOD_SUI_SIGN_AND_EXECUTE: &str = "sui_signAndExecuteTransaction";
 pub const METHOD_SUI_PERSONAL_MESSAGE: &str = "sui_signPersonalMessage";
+
+pub const METHOD_SOLANA_GET_ACCOUNTS: &str = "solana_getAccounts";
+pub const METHOD_SOLANA_REQUEST_ACCOUNTS: &str = "solana_requestAccounts";
+pub const METHOD_SOLANA_SIGN_MESSAGE: &str = "solana_signMessage";
+pub const METHOD_SOLANA_SIGN_TRANSACTION: &str = "solana_signTransaction";
+pub const METHOD_SOLANA_SIGN_AND_SEND: &str = "solana_signAndSendTransaction";
+pub const METHOD_SOLANA_SIGN_ALL: &str = "solana_signAllTransactions";
+
+/// Most transactions a single `solana_signAllTransactions` request may carry.
+pub const MAX_SOLANA_BATCH: usize = 10;
+const MAX_LEGACY_INSTRUCTIONS: usize = 20;
+const MAX_LEGACY_KEYS: usize = 64;
 
 const MAX_CALL_DATA: usize = 128 * 1024;
 const MAX_TEXT_PREVIEW: usize = 2000;
@@ -59,9 +75,31 @@ pub struct SuiRequest {
     pub message: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolanaKind {
+    GetAccounts,
+    SignMessage,
+    SignTransaction,
+    SignAndSend,
+    SignAll,
+}
+
+/// A Solana request. Solana transactions do not name their signer, so the wallet signs for its
+/// own account if the transaction requires it; `pubkey` is only given for `solana_signMessage`.
+#[derive(Debug, Clone)]
+pub struct SolanaRequest {
+    pub kind: SolanaKind,
+    pub pubkey: Option<Pubkey>,
+    /// One transaction, or several for `solana_signAllTransactions`.
+    pub transactions: Vec<SolanaTransaction>,
+    /// The message to sign (the request carries it base58-encoded).
+    pub message: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Sui(SuiRequest),
+    Solana(SolanaRequest),
     SendTransaction(TxRequest),
     SignTransaction(TxRequest),
     PersonalSign {
@@ -75,10 +113,10 @@ pub enum Action {
 }
 
 impl Action {
-    /// The Ethereum signer the dapp named; `None` for Sui requests.
+    /// The Ethereum signer the dapp named; `None` for Sui and Solana requests.
     pub fn signer(&self) -> Option<&Address> {
         Some(match self {
-            Action::Sui(_) => return None,
+            Action::Sui(_) | Action::Solana(_) => return None,
             Action::SendTransaction(tx) | Action::SignTransaction(tx) => &tx.from,
             Action::PersonalSign { address, .. } | Action::SignTypedData { address, .. } => address,
         })
@@ -282,6 +320,161 @@ fn parse_sui(method: &str, params: &Value) -> Result<Action, String> {
     }))
 }
 
+/// The deprecated `solana_signTransaction` form: `{feePayer, recentBlockhash, instructions}`.
+/// Instruction data is base58, as in Reown's reference.
+fn legacy_solana_transaction(object: &Value) -> Result<SolanaTransaction, String> {
+    let fee_payer = solana_address::parse(
+        object
+            .get("feePayer")
+            .and_then(Value::as_str)
+            .ok_or("the request has neither a 'transaction' nor a 'feePayer'")?,
+    )
+    .map_err(|e| format!("feePayer: {e}"))?;
+    let blockhash = base58::decode_fixed::<32>(
+        object
+            .get("recentBlockhash")
+            .and_then(Value::as_str)
+            .ok_or("the request has no 'recentBlockhash'")?,
+    )
+    .map_err(|_| "recentBlockhash is not a valid blockhash".to_string())?;
+    let list = object
+        .get("instructions")
+        .and_then(Value::as_array)
+        .ok_or("the request has no 'instructions'")?;
+    if list.is_empty() || list.len() > MAX_LEGACY_INSTRUCTIONS {
+        return Err(format!(
+            "a request must carry 1 to {MAX_LEGACY_INSTRUCTIONS} instructions"
+        ));
+    }
+    let mut instructions = vec![];
+    for item in list {
+        let program_id = solana_address::parse(
+            item.get("programId")
+                .and_then(Value::as_str)
+                .ok_or("an instruction has no 'programId'")?,
+        )
+        .map_err(|e| format!("programId: {e}"))?;
+        let data = match item.get("data").and_then(Value::as_str) {
+            Some(text) => base58::decode(text)
+                .map_err(|_| "instruction data is not valid base58".to_string())?,
+            None => vec![],
+        };
+        let mut accounts = vec![];
+        for key in item
+            .get("keys")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            if accounts.len() >= MAX_LEGACY_KEYS {
+                return Err("an instruction names too many accounts".to_string());
+            }
+            accounts.push(AccountMeta {
+                pubkey: solana_address::parse(
+                    key.get("pubkey")
+                        .and_then(Value::as_str)
+                        .ok_or("an account has no 'pubkey'")?,
+                )
+                .map_err(|e| format!("account: {e}"))?,
+                is_signer: key
+                    .get("isSigner")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                is_writable: key
+                    .get("isWritable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+        }
+        instructions.push(Instruction {
+            program_id,
+            accounts,
+            data,
+        });
+    }
+    let message = solana_tx::compile_legacy(&fee_payer, &instructions, blockhash)?;
+    Ok(SolanaTransaction::unsigned(message))
+}
+
+/// Solana parameters are an object; a one-element list holding that object is tolerated.
+fn parse_solana(method: &str, params: &Value) -> Result<Action, String> {
+    let object = match params {
+        Value::Array(list) if list.len() == 1 => &list[0],
+        other => other,
+    };
+    let request = |kind, pubkey, transactions, message| {
+        Ok(Action::Solana(SolanaRequest {
+            kind,
+            pubkey,
+            transactions,
+            message,
+        }))
+    };
+    match method {
+        METHOD_SOLANA_GET_ACCOUNTS | METHOD_SOLANA_REQUEST_ACCOUNTS => {
+            request(SolanaKind::GetAccounts, None, vec![], vec![])
+        }
+        METHOD_SOLANA_SIGN_MESSAGE => {
+            if !matches!(object, Value::Object(_)) {
+                return Err(format!("{method} parameters must be an object"));
+            }
+            let encoded = object
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or("solana_signMessage needs a 'message'")?;
+            let message = base58::decode(encoded)
+                .map_err(|_| "the message is not valid base58".to_string())?;
+            if message.is_empty() {
+                return Err("the message is empty".to_string());
+            }
+            if message.len() > solana_tx::MAX_MESSAGE_BYTES {
+                return Err("the message is too large".to_string());
+            }
+            let pubkey = solana_address::parse(
+                object
+                    .get("pubkey")
+                    .and_then(Value::as_str)
+                    .ok_or("solana_signMessage needs the signer 'pubkey'")?,
+            )
+            .map_err(|e| format!("signer pubkey: {e}"))?;
+            request(SolanaKind::SignMessage, Some(pubkey), vec![], message)
+        }
+        METHOD_SOLANA_SIGN_TRANSACTION | METHOD_SOLANA_SIGN_AND_SEND => {
+            if !matches!(object, Value::Object(_)) {
+                return Err(format!("{method} parameters must be an object"));
+            }
+            let transaction = match object.get("transaction").and_then(Value::as_str) {
+                Some(text) => SolanaTransaction::from_text(text)?,
+                None => legacy_solana_transaction(object)?,
+            };
+            let kind = if method == METHOD_SOLANA_SIGN_TRANSACTION {
+                SolanaKind::SignTransaction
+            } else {
+                SolanaKind::SignAndSend
+            };
+            request(kind, None, vec![transaction], vec![])
+        }
+        _ => {
+            let list = object
+                .get("transactions")
+                .and_then(Value::as_array)
+                .ok_or("solana_signAllTransactions needs a list of 'transactions'")?;
+            if list.is_empty() || list.len() > MAX_SOLANA_BATCH {
+                return Err(format!(
+                    "a request must carry 1 to {MAX_SOLANA_BATCH} transactions"
+                ));
+            }
+            let mut transactions = vec![];
+            for item in list {
+                transactions.push(SolanaTransaction::from_text(
+                    item.as_str().ok_or("a transaction must be a string")?,
+                )?);
+            }
+            request(SolanaKind::SignAll, None, transactions, vec![])
+        }
+    }
+}
+
 pub fn parse_request(method: &str, params: &Value) -> Result<Action, String> {
     match method {
         METHOD_SEND_TRANSACTION | METHOD_SIGN_TRANSACTION => {
@@ -297,6 +490,12 @@ pub fn parse_request(method: &str, params: &Value) -> Result<Action, String> {
         | METHOD_SUI_SIGN_TRANSACTION
         | METHOD_SUI_SIGN_AND_EXECUTE
         | METHOD_SUI_PERSONAL_MESSAGE => parse_sui(method, params),
+        METHOD_SOLANA_GET_ACCOUNTS
+        | METHOD_SOLANA_REQUEST_ACCOUNTS
+        | METHOD_SOLANA_SIGN_MESSAGE
+        | METHOD_SOLANA_SIGN_TRANSACTION
+        | METHOD_SOLANA_SIGN_AND_SEND
+        | METHOD_SOLANA_SIGN_ALL => parse_solana(method, params),
         METHOD_PERSONAL_SIGN => parse_personal_sign(params),
         METHOD_TYPED_DATA | METHOD_TYPED_DATA_V4 => parse_typed(method, params),
         other => Err(format!(
@@ -456,6 +655,143 @@ mod tests {
 
     fn parse(method: &str, params: &str) -> Result<Action, String> {
         parse_request(method, &json::parse(params).unwrap())
+    }
+
+    fn sol_key(n: u8) -> Pubkey {
+        [n; 32]
+    }
+
+    fn sol_transaction() -> SolanaTransaction {
+        let ix = solana_tx::system_transfer(&sol_key(1), &sol_key(2), 5);
+        SolanaTransaction::unsigned(
+            solana_tx::compile_legacy(&sol_key(1), &[ix], [9u8; 32]).unwrap(),
+        )
+    }
+
+    #[test]
+    fn parses_solana_account_requests() {
+        for method in ["solana_getAccounts", "solana_requestAccounts"] {
+            let Action::Solana(r) = parse(method, "{}").unwrap() else {
+                panic!()
+            };
+            assert_eq!(r.kind, SolanaKind::GetAccounts);
+            assert!(r.transactions.is_empty() && r.message.is_empty());
+        }
+        let Action::Solana(r) = parse("solana_getAccounts", "null").unwrap() else {
+            panic!()
+        };
+        assert_eq!(r.kind, SolanaKind::GetAccounts);
+    }
+
+    #[test]
+    fn parses_solana_message_requests() {
+        let message = base58::encode(b"Sign in to example.com");
+        let pubkey = solana_address::to_text(&sol_key(1));
+        let params = format!(r#"{{"message":"{message}","pubkey":"{pubkey}"}}"#);
+        let Action::Solana(r) = parse("solana_signMessage", &params).unwrap() else {
+            panic!()
+        };
+        assert_eq!(r.kind, SolanaKind::SignMessage);
+        assert_eq!(r.message, b"Sign in to example.com");
+        assert_eq!(r.pubkey, Some(sol_key(1)));
+        assert!(parse("solana_signMessage", &format!("[{params}]")).is_ok());
+        assert!(r.transactions.is_empty());
+        for bad in [
+            r#"{"pubkey":"x"}"#.to_string(),
+            format!(r#"{{"message":"{message}"}}"#),
+            format!(r#"{{"message":"0OIl","pubkey":"{pubkey}"}}"#),
+            format!(r#"{{"message":"","pubkey":"{pubkey}"}}"#),
+            format!(r#"{{"message":"{message}","pubkey":"nope"}}"#),
+            "[]".to_string(),
+            format!(
+                r#"{{"message":"{}","pubkey":"{pubkey}"}}"#,
+                base58::encode(&vec![7u8; solana_tx::MAX_MESSAGE_BYTES + 1])
+            ),
+        ] {
+            assert!(parse("solana_signMessage", &bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_solana_transaction_requests() {
+        let tx = sol_transaction();
+        let params = format!(r#"{{"transaction":"{}"}}"#, tx.to_base64());
+        for (method, kind) in [
+            ("solana_signTransaction", SolanaKind::SignTransaction),
+            ("solana_signAndSendTransaction", SolanaKind::SignAndSend),
+        ] {
+            let Action::Solana(r) = parse(method, &params).unwrap() else {
+                panic!()
+            };
+            assert_eq!(r.kind, kind);
+            assert_eq!(r.transactions.len(), 1);
+            assert_eq!(r.transactions[0], tx);
+        }
+        let with_options = format!(
+            r#"{{"transaction":"{}","sendOptions":{{"skipPreflight":true}}}}"#,
+            tx.to_base64()
+        );
+        assert!(parse("solana_signAndSendTransaction", &with_options).is_ok());
+        for bad in [
+            r#"{"transaction":"AAAA"}"#,
+            r#"{"transaction":5}"#,
+            r#"{}"#,
+            r#"[]"#,
+        ] {
+            assert!(parse("solana_signTransaction", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_the_deprecated_instruction_form() {
+        let payer = solana_address::to_text(&sol_key(1));
+        let program = solana_address::to_text(&sol_key(50));
+        let blockhash = base58::encode(&[9u8; 32]);
+        let data = base58::encode(&[1, 2, 3]);
+        let params = format!(
+            r#"{{"feePayer":"{payer}","recentBlockhash":"{blockhash}","instructions":[{{"programId":"{program}","data":"{data}","keys":[{{"pubkey":"{payer}","isSigner":true,"isWritable":true}}]}}]}}"#
+        );
+        let Action::Solana(r) = parse("solana_signTransaction", &params).unwrap() else {
+            panic!()
+        };
+        let tx = &r.transactions[0];
+        assert_eq!(tx.message.fee_payer(), &sol_key(1));
+        assert_eq!(tx.message.recent_blockhash, [9u8; 32]);
+        assert_eq!(tx.message.instructions[0].data, [1, 2, 3]);
+        assert_eq!(tx.signatures.len(), 1);
+        for bad in [
+            params.replace(&blockhash, "bad"),
+            params.replace(&payer, "bad"),
+            params.replace(&data, "0OIl"),
+            params.replace("\"instructions\":[", "\"instructions\":[],\"x\":["),
+            format!(
+                r#"{{"feePayer":"{payer}","recentBlockhash":"{blockhash}","instructions":[]}}"#
+            ),
+        ] {
+            assert!(parse("solana_signTransaction", &bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_sign_all_requests_within_the_limit() {
+        let one = sol_transaction().to_base64();
+        let many = |n: usize| {
+            format!(
+                r#"{{"transactions":[{}]}}"#,
+                vec![format!("\"{one}\""); n].join(",")
+            )
+        };
+        let Action::Solana(r) = parse("solana_signAllTransactions", &many(3)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(r.kind, SolanaKind::SignAll);
+        assert_eq!(r.transactions.len(), 3);
+        assert!(parse("solana_signAllTransactions", &many(MAX_SOLANA_BATCH)).is_ok());
+        assert!(parse("solana_signAllTransactions", &many(MAX_SOLANA_BATCH + 1)).is_err());
+        assert!(parse("solana_signAllTransactions", &many(0)).is_err());
+        assert!(parse("solana_signAllTransactions", r#"{"transactions":[1]}"#).is_err());
+        assert!(parse("solana_signAllTransactions", "{}").is_err());
+        assert_eq!(parse("solana_getAccounts", "{}").unwrap().signer(), None);
     }
 
     #[test]

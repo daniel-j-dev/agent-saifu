@@ -21,41 +21,41 @@ All-in-one crypto wallet for Agents. Built from the ground up in Rust.
 
 ## Current features
 
-The MCP server lives in `core/` (Rust, stdio JSON-RPC, run with `cargo run -q` from `core/`; an MCP client launches the binary). Wallet logic for Ethereum is in `core/src/eth/`, for Sui in `core/src/sui/`. Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
+The MCP server lives in `core/` (Rust, stdio JSON-RPC, run with `cargo run -q` from `core/`; an MCP client launches the binary). Wallet logic for Ethereum is in `core/src/eth/`, for Sui in `core/src/sui/`, for Solana in `core/src/solana/`. Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
 
 ### MCP tools
 
 Every tool that touches a wallet needs the wallet's password; the wallet is unlocked only for that single call and is locked again when it returns. Unlocking one wallet never unlocks another. Wallet names are unique (case-insensitive).
 
-Two blockchains are supported: **Ethereum** (and EVM chains, selected per call with `chain_id`) and **Sui** (a wallet is bound to one network, so there is no `chain_id`). The tool is chosen by the wallet it is given: a tool shared by both reads the wallet's blockchain and does the right thing. The next table says which tools work with which wallet; the descriptions below say how each behaves (Ethereum unless a "Sui:" note says otherwise).
+Three blockchains are supported: **Ethereum** (and EVM chains, selected per call with `chain_id`), **Sui** and **Solana** (a Sui or Solana wallet is bound to one network, so there is no `chain_id`). The tool is chosen by the wallet it is given: a tool shared by several reads the wallet's blockchain and does the right thing. The next table says which tools work with which wallet; the descriptions below say how each behaves (Ethereum unless a "Sui:" or "Solana:" note says otherwise).
 
-| Tool | Ethereum | Sui | Notes |
-|---|---|---|---|
-| `get_info` | yes | yes | |
-| `create_wallet` | yes | yes | Sui takes an optional `network` (`mainnet` default, `testnet`, `devnet`) |
-| `import_wallet` | yes | yes | Sui: 24-word seed phrase, `suiprivkey1...` key or 64-hex Ed25519 key |
-| `list_wallets`, `rename_wallet`, `delete_wallet` | yes | yes | |
-| `get_wallet_address` | yes | yes | |
-| `get_wallet_balances` | yes | yes | Sui lists every coin type held; no `chain_id` / `token_contracts` |
-| `send_asset` | yes | yes | Sui: SUI or any coin type; no `chain_id` / `gas_limit` |
-| `sign_contract_transaction` | yes | yes | Sui: signs a complete transaction (`transaction_bytes`); `broadcast=true` is sign-and-execute |
-| `sign_personal_message` | yes (EIP-191) | yes | added for the Wallet Standard `signPersonalMessage` |
-| `estimate_gas_fee`, `simulate_transaction` | yes | yes | Sui: a transfer, or given `transaction_bytes`; no `value` / `data` |
-| `get_transaction` | yes | yes | Sui: `transaction_hash` is the base58 digest |
-| `get_transaction_history` | yes | yes | Sui: transactions only (no `token_transfers`) |
-| `list_networks` | yes | yes | Sui: the one network the wallet is bound to |
-| `get_swap_quote`, `swap_tokens` | yes (OpenOcean) | yes (Cetus, mainnet) | Sui: no `from_chain_id` / `to_chain_id` |
-| `view_seed_phrase`, `view_private_key`, `export_wallet` | yes | yes | Sui keys are shown as `suiprivkey1...` (plus hex) |
-| `read_smart_contract` | yes | **no** | Sui has no equivalent call-by-signature; Move calls go through `sign_contract_transaction` |
-| `add_network`, `update_network`, `delete_network` | yes | **no** | a Sui wallet is bound to its one network |
-| `add_token`, `remove_token` | yes | **no** | a Sui wallet lists every coin it holds automatically |
-| `revoke_token_approval` | yes | **no** | Sui has no token allowances |
-| `wc_*` (WalletConnect) | yes | yes | Sui uses the `sui` WalletConnect namespace (see "WalletConnect (any dapp)"); the Sui signing tools also mirror the Wallet Standard (see "Sui wallets") |
+| Tool | Ethereum | Sui | Solana | Notes |
+|---|---|---|---|---|
+| `get_info` | yes | yes | yes | |
+| `create_wallet` | yes | yes | yes | Sui and Solana take an optional `network` (`mainnet` default, `testnet`, `devnet`) |
+| `import_wallet` | yes | yes | yes | Sui: 24-word seed phrase, `suiprivkey1...` key or 64-hex Ed25519 key. Solana: 24-word seed phrase, the base58 key Phantom shows, a Solana CLI keypair byte list or hex |
+| `list_wallets`, `rename_wallet`, `delete_wallet` | yes | yes | yes | |
+| `get_wallet_address` | yes | yes | yes | |
+| `get_wallet_balances` | yes | yes | yes | Sui lists every coin type held, Solana SOL and every SPL / Token-2022 token; no `chain_id` / `token_contracts` |
+| `send_asset` | yes | yes | yes | Sui: SUI or any coin type; Solana: SOL or any token mint; no `chain_id` / `gas_limit` |
+| `sign_contract_transaction` | yes | yes | yes | Sui and Solana: sign a complete transaction (`transaction_bytes`); `broadcast=true` is sign-and-send |
+| `sign_personal_message` | yes (EIP-191) | yes | yes (raw Ed25519) | added for the Wallet Standard `signPersonalMessage` / Solana `signMessage` |
+| `estimate_gas_fee`, `simulate_transaction` | yes | yes | yes | Sui and Solana: a transfer, or given `transaction_bytes`; no `value` / `data` |
+| `get_transaction` | yes | yes | yes | Sui: `transaction_hash` is the base58 digest; Solana: the base58 signature |
+| `get_transaction_history` | yes | yes | yes | Sui and Solana: transactions only (no `token_transfers`) |
+| `list_networks` | yes | yes | yes | Sui and Solana: the one network the wallet is bound to |
+| `get_swap_quote`, `swap_tokens` | yes (OpenOcean) | yes (Cetus, mainnet) | yes (Jupiter, mainnet) | Sui and Solana: no `from_chain_id` / `to_chain_id`; Solana: no `to_address` |
+| `view_seed_phrase`, `view_private_key`, `export_wallet` | yes | yes | yes | Sui keys are shown as `suiprivkey1...` (plus hex), Solana keys as the base58 keypair Phantom imports (plus hex) |
+| `read_smart_contract` | yes | **no** | **no** | Sui and Solana have no equivalent call-by-signature; Move calls and Solana instructions go through `sign_contract_transaction` |
+| `add_network`, `update_network`, `delete_network` | yes | **no** | **no** | a Sui or Solana wallet is bound to its one network (Solana has no layer 2s to add) |
+| `add_token`, `remove_token` | yes | **no** | **no** | a Sui or Solana wallet lists every coin or token it holds automatically |
+| `revoke_token_approval` | yes | **no** | **no** | Sui has no token allowances; Solana delegates are shown by `simulate_transaction` / `wc_review_request` |
+| `wc_*` (WalletConnect) | yes | yes | yes | Sui uses the `sui` WalletConnect namespace and Solana the `solana` namespace (see "WalletConnect (any dapp)"); the Sui signing tools also mirror the Wallet Standard (see "Sui wallets"), and Solana follows Phantom (see "Solana wallets") |
 
-A Sui wallet given to an Ethereum-only tool (or the reverse) is refused with a clear message before anything is decrypted; chain-specific arguments given to the wrong wallet (for example `chain_id` for Sui) are refused too.
+A wallet given to a tool for another blockchain is refused with a clear message before anything is decrypted; chain-specific arguments given to the wrong wallet (for example `chain_id` for Sui or Solana) are refused too.
 
 - `get_info` - returns "All-in-one crypto wallet for Agents. Built from the ground up in Rust." and "Version 0.0".
-- `create_wallet` (blockchain = `ethereum` or `sui`, wallet_name, password, optional network) - new wallet with a 24-word seed phrase in a password-encrypted vault. Multiple wallets are supported. `network` is for Sui only.
+- `create_wallet` (blockchain = `ethereum`, `sui` or `solana`, wallet_name, password, optional network) - new wallet with a 24-word seed phrase in a password-encrypted vault. Multiple wallets are supported. `network` is for Sui and Solana only.
 - `import_wallet` (wallet_name, password, seed_phrase *or* private_key, optional blockchain / network) - add an existing wallet; `blockchain` defaults to `ethereum`.
 - `list_wallets` - names and blockchains only; no password.
 - `rename_wallet` (wallet_name, new_wallet_name, password) - added beyond the original list.
@@ -74,30 +74,57 @@ A Sui wallet given to an Ethereum-only tool (or the reverse) is refused with a c
 - `list_networks` (wallet_name, password) - helper for viewing a wallet's networks. Deleting a network also removes the tokens added on it.
 - `add_token` (wallet_name, chain_id, contract, password) - added beyond the original list; saves an ERC-20 token to the wallet on that network (any network the wallet has). The contract is checked on-chain and its symbol and decimals are read from it. Added tokens always appear in `get_wallet_balances`, even at zero. Stored in the encrypted vault; max 50 per network.
 - `remove_token` (wallet_name, chain_id, contract, password) - added beyond the original list; stops tracking an added token (no funds move). Built-in well-known tokens cannot be removed.
-- `get_swap_quote` (wallet_name, password, from_chain_id, from_token, to_chain_id, to_token, amount, optional slippage_bps / to_address) - added by request; previews a swap through OpenOcean without signing or sending anything: how much of the new token you will get (expected and guaranteed minimum), the fees (service fee, estimated network fee), the route, price impact, and whether an approval or more balance is needed.
-- `swap_tokens` (same parameters plus optional min_receive) - swaps through OpenOcean and broadcasts. Tokens are a contract address or `native`. If the sold token needs an approval, exactly the sold amount is approved first (a non-zero allowance is reset to zero first, as USDT requires) and confirmed before the swap is sent. `min_receive` is a safety floor: if the fresh quote's guaranteed minimum is lower, nothing is sent.
+- `get_swap_quote` (wallet_name, password, from_chain_id, from_token, to_chain_id, to_token, amount, optional slippage_bps / to_address) - added by request; previews a swap (OpenOcean on Ethereum, Cetus on Sui, Jupiter on Solana) without signing or sending anything: how much of the new token you will get (expected and guaranteed minimum), the fees (service fee, estimated network fee), the route, price impact, and whether an approval or more balance is needed.
+- `swap_tokens` (same parameters plus optional min_receive) - swaps and broadcasts (Ethereum: OpenOcean; Sui: Cetus; Solana: Jupiter). Tokens are a contract address or `native`. If the sold token needs an approval, exactly the sold amount is approved first (a non-zero allowance is reset to zero first, as USDT requires) and confirmed before the swap is sent. `min_receive` is a safety floor: if the fresh quote's guaranteed minimum is lower, nothing is sent.
 - `view_seed_phrase`, `view_private_key` (wallet_name, password)
 - `export_wallet` (wallet_name, password, encryption_key, optional file_name) - writes a ZIP to `exports/` whose single entry (`agent-saifu-wallet-export.json`) is the seed phrase and private key encrypted with MetaMask's vault scheme under the given key. Never overwrites files. The ZIP itself has no ZIP password; the entry is a MetaMask-style vault (`{data, iv, salt, keyMetadata}`, PBKDF2-HMAC-SHA256 + AES-256-GCM). **To open it later you need only the ZIP and the `encryption_key` used when exporting.** The wallet's password is needed only to create the export, not to open it, and neither key is stored anywhere, so a lost `encryption_key` cannot be recovered. The key must be at least 12 characters.
 - `revoke_token_approval` (wallet_name, chain_id, password, token, spender) - useful for revoking smart-contract token approvals (sets the ERC-20 allowance to zero).
-- `wc_pair` (uri, optional wait_seconds) - added by request; connects to any dapp over WalletConnect v2, Ethereum or Sui. Give it the `wc:` URI the dapp shows. It waits for the dapp's session proposal and returns what the dapp asks for (chains, methods, whether this wallet can satisfy it). Nothing is shared until the proposal is approved. No wallet is unlocked.
+- `wc_pair` (uri, optional wait_seconds) - added by request; connects to any dapp over WalletConnect v2, Ethereum, Sui or Solana. Give it the `wc:` URI the dapp shows. It waits for the dapp's session proposal and returns what the dapp asks for (chains, methods, whether this wallet can satisfy it). Nothing is shared until the proposal is approved. No wallet is unlocked.
 - `wc_list_proposals`, `wc_reject_session` (proposal_id) - waiting connection proposals; decline one.
-- `wc_approve_session` (proposal_id, wallet_name, password, chain_id for Ethereum wallets, optional additional_chain_ids) - approves a proposal with a wallet; this is the only step that reveals the address, and only to the dapp. Ethereum: the chains must cover everything the dapp requires and may only include chains the dapp asked for; the wallet needs a network for each. Sui: omit `chain_id` / `additional_chain_ids`; the dapp is connected on the wallet's own network (`sui:mainnet`, `sui:testnet` or `sui:devnet`).
+- `wc_approve_session` (proposal_id, wallet_name, password, chain_id for Ethereum wallets, optional additional_chain_ids) - approves a proposal with a wallet; this is the only step that reveals the address, and only to the dapp. Ethereum: the chains must cover everything the dapp requires and may only include chains the dapp asked for; the wallet needs a network for each. Sui: omit `chain_id` / `additional_chain_ids`; the dapp is connected on the wallet's own network (`sui:mainnet`, `sui:testnet` or `sui:devnet`). Solana: the same; the dapp is connected on the wallet's own cluster (`solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` for mainnet, `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` for devnet, `solana:4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z` for testnet).
 - `wc_list_sessions`, `wc_disconnect_session` (session_topic) - connected dapps (wallet, chains, methods; never addresses); end one.
 - `wc_list_requests` - what connected dapps are waiting on, with a summary (decoded token transfers/approvals, message text, typed data). No password; the signer's address is left out.
 - `wc_review_request` (request_id, wallet_name, password, chain_id for Ethereum wallets) - the expected costs and outcome. For transactions: a dry run (would it succeed or revert), what is sent or approved in plain language (`expected_outcome`), the network fee (max and expected, in the native coin and USDC), and whether the wallet can afford it. For messages and typed data: exactly what would be signed, with warnings. Signs and sends nothing.
-- `wc_approve_request` (request_id, wallet_name, password, chain_id for Ethereum wallets) - signs and answers the dapp. `eth_sendTransaction` is signed and broadcast; `eth_signTransaction` only signs; `personal_sign` and `eth_signTypedData(_v4)` return a signature. Sui methods are listed under "WalletConnect (any dapp)".
+- `wc_approve_request` (request_id, wallet_name, password, chain_id for Ethereum wallets) - signs and answers the dapp. `eth_sendTransaction` is signed and broadcast; `eth_signTransaction` only signs; `personal_sign` and `eth_signTypedData(_v4)` return a signature. Sui methods are listed under "WalletConnect (any dapp)", as are the Solana ones.
 - `wc_reject_request` (request_id, optional reason) - tells the dapp the user rejected it. Nothing is signed. No password.
 
 ### Swaps (OpenOcean)
 
 - **No API key, account or environment variable.** Swaps use an OpenOcean v4 swap API host (`https://open-api.de1.exchange/v4`, endpoint `/:chain/swap`). The host is the `OPENOCEAN_API_BASE_URL` setting in [core/src/swap_config.rs](core/src/swap_config.rs). The host supplies the transaction data the wallet signs, but the wallet decodes that data and refuses anything that does not match your request (see the safety checks below).
-- **Same-chain only.** OpenOcean's API swaps within one chain; its cross-chain swaps exist only in its web widget, and non-EVM chains (Solana, and so on) need a whitelisted key. So `to_chain_id` must equal `from_chain_id` (a different value returns an explanatory error), and there is no `to_blockchain` option: swaps such as ETH to BTC or SUI are not possible through this API. What *is* supported is `to_address`: an optional address on the same chain that receives the bought tokens instead of the wallet itself.
+- **Same-chain only.** OpenOcean's API swaps within one chain; its cross-chain swaps exist only in its web widget. So `to_chain_id` must equal `from_chain_id` (a different value returns an explanatory error), and there is no `to_blockchain` option: swaps such as ETH to BTC or SUI are not possible through this API. What *is* supported is `to_address`: an optional address on the same chain that receives the bought tokens instead of the wallet itself. Solana is the one non-EVM chain served through this host (see "Swaps on Solana (OpenOcean)").
 - **Chains:** the 41 chains OpenOcean lists for its swap API (Ethereum, BNB Chain, Base, Polygon, Arbitrum, Optimism, Avalanche, and others). The wallet must have the network (see `add_network`). The wallet only ever approves or sends to OpenOcean's published router contract.
 - **Costs to know about:** OpenOcean also applies its own tiered fee on public-API swaps (0.01% stable pairs, 0.1% correlated, 0.25% common, 0.5% exotic tokens).
 - **Safety checks before signing:** the quote must be for the requested tokens (decimals included), may not sell more than requested or send extra native currency, must target OpenOcean's router, must meet `min_receive`, and may not have a price impact worse than 5%. The router calldata is also decoded locally (`swap(...)` on OpenOcean's router) and must sell the requested token and the quoted amount, buy the requested token, **deliver it to the wallet (or the requested `to_address`)** and guarantee a minimum return at least the quote's (and your `min_receive`); the quote's guaranteed minimum may also not be looser than the requested slippage (plus 0.5%). So a dishonest or compromised API host cannot redirect the output or hide a bad price; calldata the wallet cannot decode is refused and nothing is sent. The approval is for exactly the sold amount, never unlimited. OpenOcean text (route names, errors) is length-limited and stripped of control characters before it reaches the agent.
 - **Rate limit:** 2 requests per second on the free API. **Known issue:** OpenOcean's Cloudflare bot protection challenged the quote and swap endpoints (HTTP 403) when tested from a cloud server, so swaps may fail from some networks; the tools then say so and send nothing.
 
-Ethereum wallets use the OpenOcean aggregator (this section); Sui wallets use the Cetus aggregator (see "Swaps on Sui (Cetus)"). Chain IDs select Ethereum networks such as Base or Arbitrum; Sui has no chain IDs (a wallet is bound to a network), so Sui tools do not take one.
+Ethereum wallets use the OpenOcean aggregator (this section); Sui wallets use the Cetus aggregator (see "Swaps on Sui (Cetus)"); Solana wallets use the Jupiter aggregator (see "Swaps on Solana (Jupiter)"). Chain IDs select Ethereum networks such as Base or Arbitrum; Sui and Solana have no chain IDs (a wallet is bound to a network), so their tools do not take one.
+
+### Solana wallets
+
+Solana wallets are created and used like Ethereum and Sui wallets (same vault encryption, per-call unlocking, password rate limiting, tools), with these specifics. They were built following Phantom's behaviour and documentation (derivation paths, `signMessage`, `signAndSendTransaction` as the preferred way to send, transaction simulation before approval) and the Solana and Reown (WalletConnect) RPC references. The cryptography uses crates the project already depends on (`ed25519-dalek`); transaction encoding, program-derived addresses and the JSON-RPC client are implemented in this repository, with no Solana SDK.
+
+- **Keys.** Ed25519. A 24-word BIP39 seed phrase derives the key with SLIP-0010 at `m/44'/501'/0'/0'`, the path Phantom uses for its first account, so a phrase from Phantom gives the same address (checked against Phantom's published address for the standard test phrase, and independently re-derived in Python for a 24-word phrase; the signing and transaction layouts were checked against an independent implementation and against a live node). Imported private keys may be the base58 keypair Phantom and Solflare show (64 bytes: the secret, then the public key, which must match), a Solana CLI keypair file's list of bytes, or hex of the 32-byte secret. `view_private_key` shows the base58 keypair (plus hex), which Phantom imports. Accounts of phrases that used the older `m/44'/501'/0'` path are not covered (Phantom only finds them when there is on-chain activity).
+- **Self-custody.** The vault is the same PBKDF2-SHA256 900,000 iterations + AES-256-GCM format with MetaMask's keyring layout; the cluster is stored inside the vault. The wallet file holds only the name, blockchain and vault.
+- **One network per wallet.** Like a Sui wallet, a Solana wallet is bound to one cluster (`mainnet` by default, `devnet` or `testnet`, recorded inside the vault; `mainnet-beta` is accepted as a name for mainnet). Every call first checks that the RPC endpoint really serves that cluster (by its genesis hash), and a transaction whose blockhash the cluster does not recognise is refused, so a devnet key never signs a mainnet transaction. Create separate wallets for separate clusters. Solana has no layer 2s to add, so `add_network` and friends do not apply.
+- **Node access.** Reads, simulation and submission use Solana's JSON-RPC over HTTPS with certificate checking. The endpoints are the public Solana Foundation nodes, set in [core/src/solana_config.rs](core/src/solana_config.rs); replace them with your own provider's URL for heavier use (they are rate limited). A provider URL may contain a secret, so tools only ever show its host.
+- **Balances.** SOL plus every SPL Token and Token-2022 token the address holds (a token's balance adds up all of its accounts). `usdc_value` comes from CoinGecko on mainnet (SOL, USDC at 1, and the first 30 tokens CoinGecko prices); it is `null` on devnet and testnet. Tokens are named from a short built-in list (USDC, USDT, PYUSD, wSOL, mSOL, JitoSOL, JUP, BONK, RAY, WIF) and otherwise shown by a shortened mint address and flagged as unrecognised, because Solana wallets collect spam airdrops. Names and prices are for display only; amounts that are sent always use the decimals the token's mint reports.
+- **Sending.** `send_asset` sends SOL or any token by mint address. A token send uses `TransferChecked` (the token program verifies the mint and decimals), picks the wallet's account holding enough of the token, derives the recipient's associated token account and opens it (`CreateIdempotent`, paid by the sender, about 0.00204 SOL) when it does not exist. Recipients that are program addresses (including the system program, the burn address) and the wallet itself are refused. The transaction is dry-run first, given a compute-unit limit from the dry run plus headroom and a priority fee from recent network demand (capped at 0.00005 SOL), signed, submitted with the node's own preflight check, and the wallet waits for `confirmed`. A transaction that would fail is never signed.
+- **Lost answers.** If the answer to a submission is lost, the transaction's signature (known locally) is looked up first: if the cluster has it, it is reported with its status; if the node answered with a rejection and has no such transaction, it is reported as rejected and nothing was spent; otherwise the error returns the signature and says to check `get_transaction` before building another transaction. Submitting the same signed transaction again is harmless, but a transaction expires after about a minute.
+- **Per-action unlock.** The wallet is unlocked only for the call, like every other tool.
+- **What `sign_contract_transaction` checks for Solana.** The transaction (legacy or version 0, base64 or base58; at most 1,232 bytes) must name this wallet as one of its signers and its blockhash must be valid on the wallet's cluster (a durable-nonce transaction is accepted). Address lookup tables are read from the node so every account can be named. The response decodes every instruction in plain language (system and token transfers, token approvals with a warning when unlimited, authority changes, account closing, assignments, memos, compute budget; any other program is shown as unrecognised with a warning), reports when the wallet is not the fee payer or other signatures are missing, and shows the wallet's balance changes from a dry run (SOL and every token, the network fee included; new spending approvals or ownership changes of the wallet's token accounts are warned about). By default it only signs, filling in the wallet's signature and leaving other signers' slots as they are; `broadcast=true` is sign-and-send and is refused unless the dry run succeeds and no other signature is missing.
+- **Messages.** `sign_personal_message` signs the raw message bytes with the Ed25519 key, as Phantom's `signMessage` does (base58 and base64 signatures). Bytes that parse as a Solana transaction or message are refused, because signing them would sign a transaction.
+- **Simulation.** `simulate_transaction` and `estimate_gas_fee` accept a transfer or `transaction_bytes`. They work on a wallet that cannot afford the transfer (the shortfall is reported as the dry run's error). The balance changes come from comparing every writable account before and after the simulated transaction, so they are right whatever programs are called.
+- **Lookups.** `get_transaction` takes the base58 signature and reports status, slot, fee, the wallet's SOL and token changes, confirmation level and an explorer link. `get_transaction_history` lists the signatures that touched the address (status, time, memo; memos are untrusted text).
+- **Text from the network** (error messages, memos, logs) is length-limited and stripped of control characters before it reaches the agent.
+
+### Swaps on Solana (Jupiter)
+
+Solana swaps use Jupiter's Swap API v2 (`JUPITER_API_BASE_URL` in [core/src/swap_config.rs](core/src/swap_config.rs), default `https://api.jup.ag/swap/v2`) through its **keyless** access: no API key, account or environment variable, at about one request every two seconds (a `429` is reported as a rate-limit message to retry shortly). OpenOcean is not used for Solana (its host stopped supporting the chain). The `/build` endpoint (Jupiter's "Router" path, Metis routing) answers with raw swap instructions rather than a transaction, and charges no Jupiter swap fee; the wallet assembles the transaction itself.
+
+- **Mainnet only, same-chain.** `from_token` / `to_token` are `native` (SOL) or a token mint address; wrapped SOL is not accepted as a token (Jupiter addresses SOL by that mint, and wraps and unwraps it inside the swap). There is no `to_address` and no cross-chain option; the bought tokens always arrive in the wallet. `slippage_bps` (default 100, 5 to 1000) and `min_receive` work as on Ethereum. Swaps are exact-input: the amount is what is sold.
+- **The wallet builds the transaction.** Jupiter's setup, swap and cleanup instructions are placed after a compute-unit limit sized by a dry run of the swap (the dry run's usage plus headroom) and a priority fee (Jupiter's suggestion, or the cluster's recent fee, never above 250,000 micro-lamports per unit). The blockhash comes from the wallet's own node. Jupiter's address lookup tables are used to fit the route, but the wallet reads those tables on chain and refuses the swap unless they hold exactly the accounts Jupiter described. Routes differ a lot in size: when the assembled transaction would not fit Solana's 1,232-byte limit (more often for a wallet that has no token accounts yet), the swap is requested again with `maxAccounts` 40 and then 28 so that Jupiter picks a simpler route, and refused with an explanation if none fits.
+- **Nothing from Jupiter is trusted.** Before signing: the quote must match the request (same tokens, exact input, no more sold than requested, minimum no looser than the slippage plus 0.5%, `min_receive`, price impact at most 5%); the wallet must be the fee payer and the only missing signer; no instruction may approve a delegate, change an authority or assign the wallet's account; the blockhash must be valid; and a simulation of the exact instructions must show that the wallet spends no more than requested (for SOL, plus network fees and the deposit for any token account it opens), receives at least the quoted minimum, and loses nothing of any other token (every writable account is compared, including accounts loaded from lookup tables). Any new spending approval or ownership change in the simulation stops the swap.
+- **Live verification.** On mainnet (2026-11-09) the keyless endpoint returned SOL to USDC, USDC to SOL and USDC to JUP swaps; each assembled transaction was dry-run by a node against real accounts, resolved against the real lookup tables and passed every check, and with a fee configured the simulated post-state showed the fee arriving in the recipient's token account (USDC, wrapped SOL and JUP respectively). No funded swap was sent.
 
 ### Sui wallets
 
@@ -132,14 +159,20 @@ Sui swaps go through the [Cetus aggregator](https://cetus-1.gitbook.io/cetus-dev
 
 The wallet speaks the WalletConnect v2 Sign protocol as the wallet side, so any dapp that shows a WalletConnect QR code or `wc:` link can connect: Uniswap, OpenSea, Aave, and so on. The flow for an agent:
 
-1. `wc_pair` with the dapp's `wc:` URI, then look at the proposal it returns (`can_connect_with` says whether an Ethereum wallet, a Sui wallet or both can satisfy it).
+1. `wc_pair` with the dapp's `wc:` URI, then look at the proposal it returns (`can_connect_with` says whether an Ethereum wallet, a Sui wallet, a Solana wallet or several can satisfy it).
 2. `wc_approve_session` (proposal_id, **wallet_name**, **password**, and **chain_id** for Ethereum wallets) to connect, or `wc_reject_session`.
 3. When the dapp asks for something, `wc_list_requests` shows it. `wc_review_request` shows the expected costs and outcome. `wc_approve_request` (request_id, **wallet_name**, **password**, and **chain_id** for Ethereum wallets) signs / sends and answers the dapp; `wc_reject_request` declines.
 
 - **Setup: a project ID is needed.** WalletConnect's relay requires a free project ID. Create one at https://dashboard.walletconnect.com/ and set the `WALLETCONNECT_PROJECT_ID` environment variable, or put it in `WALLETCONNECT_PROJECT_ID` in [core/src/walletconnect_config.rs](core/src/walletconnect_config.rs) (the variable wins). Without it every `wc_*` tool says what is missing and the rest of the wallet is unaffected.
-- **Wallet, chain and password on every approval.** `wc_approve_session`, `wc_review_request` and `wc_approve_request` all require the wallet name and password, and Ethereum wallets also the chain ID (a Sui wallet must omit it: it is bound to one network, and giving one is an error). The wallet must be the one the dapp's session was connected with, and the chain must be the one the request is for; otherwise the call fails before anything is unlocked or signed and the request stays open. Passwords are checked (and rate limited) like every other tool.
+- **Wallet, chain and password on every approval.** `wc_approve_session`, `wc_review_request` and `wc_approve_request` all require the wallet name and password, and Ethereum wallets also the chain ID (a Sui or Solana wallet must omit it: it is bound to one network, and giving one is an error). The wallet must be the one the dapp's session was connected with, and the chain must be the one the request is for; otherwise the call fails before anything is unlocked or signed and the request stays open. Passwords are checked (and rate limited) like every other tool.
 - **Per-action unlock.** The wallet is unlocked only inside `wc_approve_session`, `wc_review_request` and `wc_approve_request`, and locked again when the call returns. A session holds only WalletConnect keys, never wallet secrets or the address.
-- **Supported methods:** `eth_sendTransaction`, `eth_signTransaction`, `personal_sign`, `eth_signTypedData` and `eth_signTypedData_v4` (EIP-712). `eth_sign` is never granted: it signs an arbitrary hash and cannot be reviewed, so a dapp that requires it cannot be connected. Contract creation is refused. The namespaces are `eip155` (Ethereum) and `sui`; a dapp that requires another namespace (e.g. Solana) cannot be connected, and a dapp that requires both `eip155` and `sui` cannot be connected either, because a session belongs to one wallet on one blockchain.
+- **Supported methods:** `eth_sendTransaction`, `eth_signTransaction`, `personal_sign`, `eth_signTypedData` and `eth_signTypedData_v4` (EIP-712). `eth_sign` is never granted: it signs an arbitrary hash and cannot be reviewed, so a dapp that requires it cannot be connected. Contract creation is refused. The namespaces are `eip155` (Ethereum), `sui` and `solana`; a dapp that requires another namespace (e.g. Cosmos) cannot be connected, and a dapp that requires more than one of `eip155`, `sui` and `solana` cannot be connected either, because a session belongs to one wallet on one blockchain.
+- **Solana over WalletConnect.** Implemented to Reown's Solana RPC reference (namespace `solana`, chains `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` mainnet, `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` devnet and `solana:4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z` testnet, plus the legacy identifiers some dapps still send for mainnet and devnet, which are answered in the form the dapp used), as the wallet side only.
+  - *Connecting.* A Solana wallet approves a proposal with `wc_approve_session` (no `chain_id`). The session is granted exactly one cluster, the wallet's own, so a dapp that *requires* another cluster, or `eip155` or `sui`, is refused, and one that only lists the wallet's cluster as optional is accepted. The settle message carries the account `solana:<chain>:<address>` and the methods the dapp asked for that the wallet supports. As with the other blockchains, the agent never sees the address in the proposal, the session or the request list; it is revealed only to the dapp.
+  - *Methods* (all others are refused with "Unauthorized method" before the agent sees them): `solana_getAccounts` and `solana_requestAccounts` (answered with `[{pubkey}]`; normal requests needing `wc_approve_request`, because a session stores no address), `solana_signMessage` (params `{message: base58, pubkey}`; answered `{signature}` in base58), `solana_signTransaction` (params `{transaction: base64}`; answered `{signature, transaction}`, signed only), `solana_signAndSendTransaction` (same params; signed **and submitted**; answered `{signature}`) and `solana_signAllTransactions` (up to 10 transactions; answered `{transactions}`, signed only, and none is signed unless every one can be). The deprecated `{feePayer, recentBlockhash, instructions}` form of `solana_signTransaction` is accepted too.
+  - *Checks.* The request's chain must match the session and the wallet's cluster, and `pubkey` (for messages) must be the wallet's address, or it is refused before anything is signed. A transaction goes through the same checks as `sign_contract_transaction` (the wallet is a signer, the blockhash is valid on the cluster), and the review shows every instruction, warnings and the dry run's balance changes. `solana_signAndSendTransaction` is refused unless the dry run succeeds and no other signature is missing, and the request stays open. A message that is also a valid transaction is refused (Phantom's rule). Sizes are limited (1,232 bytes per transaction, 64 KiB of message).
+  - *Mixing blockchains.* A Solana session answers only `solana_*` requests, a Sui session only `sui_*` ones and an Ethereum session only `eth_*` / `personal_sign` ones. Using a wallet of another blockchain for a request fails before anything is unlocked or signed.
+  - *Not covered.* Events (`accountsChanged` etc.) are never sent, a Solana wallet cannot switch clusters within a session, and Solana Pay / wallet-standard features outside the WalletConnect methods above are not offered. Tested against a simulated relay and Solana node, not against a live dapp.
 - **Sui over WalletConnect.** Implemented to Reown's Sui RPC reference (namespace `sui`, chains `sui:mainnet` / `sui:testnet` / `sui:devnet`), as the wallet side only.
   - *Connecting.* A Sui wallet approves a proposal with `wc_approve_session` (no `chain_id`). The session is granted exactly one chain, the wallet's own network, so a dapp that *requires* another Sui network, or that requires `eip155`, is refused, and one that only lists the wallet's network as optional is accepted. The settle message carries the account `sui:<network>:<address>`, the granted methods (always including `sui_getAccounts`, which Reown requires of Sui connections), and `sessionProperties.sui_getAccounts`, a JSON string of `[{"pubkey": <base64 of 0x00 flag byte + 32-byte Ed25519 key>, "address": <0x...>}]`, so a dapp can learn the account without asking. As with Ethereum, the agent never sees the address in the proposal, the session or the request list; it is revealed only to the dapp.
   - *Methods* (all others are refused with "Unauthorized method" before the agent sees them): `sui_getAccounts` (answered with the same `[{pubkey, address}]` list; it is a normal request needing `wc_approve_request`, because a session stores no address), `sui_signTransaction` (params `{transaction: base64 BCS TransactionData, address}`; answered `{signature, transactionBytes}`, signed only), `sui_signAndExecuteTransaction` (same params; signed **and submitted**; answered `{digest}`) and `sui_signPersonalMessage` (params `{message, address}`; answered `{signature}`, using Sui's personal-message intent).
@@ -160,8 +193,8 @@ The wallet speaks the WalletConnect v2 Sign protocol as the wallet side, so any 
 
 - Vault encryption matches MetaMask's `browser-passworder`: PBKDF2-HMAC-SHA256 (900,000 iterations, 32-byte salt) derives an AES-256-GCM key (16-byte IV); the vault is `{data, iv, salt, keyMetadata}` in base64. The vault plaintext uses MetaMask's keyring layout (`HD Key Tree` / `Simple Key Pair`). Verified against vaults produced and read by WebCrypto.
 - The wallet file holds only the name, blockchain and vault. Addresses, balances, networks, added tokens and keys exist only inside the encrypted vault. Files are `0600`, directories `0700`; writes are atomic and never overwrite exports.
-- Seed phrases are always 24 words (BIP39, checksum-validated); Ethereum keys derive at `m/44'/60'/0'/0/0`, Sui keys (Ed25519, SLIP-0010) at `m/44'/784'/0'/0'/0'`.
-- Passwords must be at least 8 characters (export keys 12). Five wrong passwords lock a wallet for 60 seconds (the same limiter covers Ethereum and Sui wallets). A tool for one blockchain given a wallet of the other is refused before anything is decrypted.
+- Seed phrases are always 24 words (BIP39, checksum-validated); Ethereum keys derive at `m/44'/60'/0'/0/0`, Sui keys (Ed25519, SLIP-0010) at `m/44'/784'/0'/0'/0'`, Solana keys (Ed25519, SLIP-0010) at `m/44'/501'/0'/0'`.
+- Passwords must be at least 8 characters (export keys 12). Five wrong passwords lock a wallet for 60 seconds (the same limiter covers Ethereum, Sui and Solana wallets). A tool for one blockchain given a wallet of another is refused before anything is decrypted.
 - Secrets are wiped from memory after each call where possible; request/response buffers are zeroed. Secrets are never logged and are never included in error messages.
 - Text coming from third parties (token names, explorer data) is shortened and stripped of control characters before it reaches an agent; RPC URLs must be https (http only for localhost) and may not be literal private-network IPv4 addresses.
 - No double payments on a lost broadcast response. Before every broadcast the signed transaction (hash, nonce, raw bytes; no keys) is saved in `$AGENT_SAIFU_HOME/pending/` and removed once the node answers. If the response is lost (timeout, network error), the record stays and the error says the outcome is unknown and not to retry. The next send from that wallet on that network first looks the transaction up: if the node has it, nothing is sent and the agent is told it was already accepted; if not, the identical signed bytes are resubmitted (same nonce, so never a second payment) and reported; if the node can't be reached, nothing is sent until it can be checked.
@@ -182,11 +215,12 @@ Sui support uses the official Sui Rust SDK (https://github.com/MystenLabs/sui-ru
 
 - `sui-sdk-types` 0.4 (Sui transaction/address/type definitions, BCS encoding, digests; ~359k downloads), `sui-crypto` 0.4 (Ed25519 keys, `suiprivkey` Bech32, transaction and personal-message signing in Sui's intent scheme; ~122k downloads) and `sui-transaction-builder` 0.4 (offline programmable-transaction builder, `intents` feature off; ~116k downloads). These have far fewer downloads than the other crates above because Sui's Rust SDK is young and specialised, but they are the SDK Mysten Labs publishes for this purpose; their signing and addressing output was also cross-checked against independent implementations (see the tests). Their dependencies are widely used RustCrypto/serde crates (`ed25519-dalek` 2.2 ~249M downloads, `curve25519-dalek` 4.1.3, `blake2` ~188M, `sha2`, `bcs` ~9.8M, `bech32` ~64M, `bs58` ~168M, `serde_with` ~412M, `roaring` ~59M, `bnum` ~21M).
 - SLIP-0010 (Ed25519 key derivation), the MetaMask-style Sui vault, GraphQL access and the Cetus aggregator integration are implemented in this repository.
+- Solana support adds **no new crates**: Ed25519 uses `ed25519-dalek` (already used for relay authentication), and base58, SLIP-0010, the transaction format (legacy and version 0 messages), program-derived addresses, instruction decoding, the JSON-RPC client and the OpenOcean integration are implemented in this repository. Everything was checked against independent computations (a Python implementation of the derivation, Ed25519 signing and the message layout; Phantom's published address for a standard phrase; an associated token account address listed by a mainnet node) and, for signatures, against a live node that verified a wallet-signed transaction.
 - Audit result (RustSec advisory database checked on 2026-10-24 against every package in `Cargo.lock`): no advisory applies to the locked versions of the new Sui dependencies (`ed25519-dalek` 2.2.0 and `curve25519-dalek` 4.1.3 are past RUSTSEC-2022-0093 and RUSTSEC-2024-0344). The audit also found two timing advisories published the day before, RUSTSEC-2026-0385 (`ctutils`) and RUSTSEC-2026-0387 (`crypto-bigint`), in crates that `k256` already pulled in for Ethereum signing; `Cargo.lock` now pins their patched versions (`ctutils` 0.4.5, `crypto-bigint` 0.7.6). One informational notice remains: `ring` 0.17.14 is flagged "unmaintained" (RUSTSEC-2025-0007) through `rustls`, which was already the case.
 
 ### External services
 
-Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). The WalletConnect relay (`relay.walletconnect.org`, needs a free project ID). Custom networks supply their own RPC and explorer. For Sui: the network's GraphQL endpoint (`graphql.mainnet.sui.io`, `graphql.testnet.sui.io` or `graphql.devnet.sui.io`; reads, dry runs, submission) and the Cetus aggregator (`api-sui.cetus.zone`, routes for swaps and indicative prices; no key); SUI prices also come from CoinGecko.
+Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). The WalletConnect relay (`relay.walletconnect.org`, needs a free project ID). Custom networks supply their own RPC and explorer. For Sui: the network's GraphQL endpoint (`graphql.mainnet.sui.io`, `graphql.testnet.sui.io` or `graphql.devnet.sui.io`; reads, dry runs, submission) and the Cetus aggregator (`api-sui.cetus.zone`, routes for swaps and indicative prices; no key); SUI prices also come from CoinGecko. For Solana: the cluster's JSON-RPC endpoint (`api.mainnet-beta.solana.com`, `api.devnet.solana.com` or `api.testnet.solana.com`, configurable in `core/src/solana_config.rs`; reads, simulation, submission), the Jupiter Swap API (`api.jup.ag/swap/v2/build`, swaps; keyless, no key), `explorer.solana.com` links, and CoinGecko for SOL and token prices.
 
 ## Usage Examples
 
@@ -412,7 +446,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_network","arguments":{"wallet_name":"Demo","password":"demo-password-123","chain_id":8453}}}' | cargo run -q
 ```
 
-### WalletConnect (Ethereum, layer 2s and Sui)
+### WalletConnect (Ethereum, layer 2s, Sui and Solana)
 
 Sessions live in the server process, so run these in one process (piped lines, or an MCP client that keeps the server running). Set the project ID first (see the WalletConnect section above) and use a wallet that has a network for the chain the dapp wants:
 
@@ -420,7 +454,7 @@ Sessions live in the server process, so run these in one process (piped lines, o
 export WALLETCONNECT_PROJECT_ID=<your project id>
 ```
 
-Connect: copy the `wc:` URI from the dapp, then pair, check the proposal and approve it with the wallet name, chain ID and password (a Sui wallet leaves out `chain_id`: `"arguments":{"proposal_id":"<id>","wallet_name":"DemoSui","password":"demo-password-123"}`; use the same shape for `wc_review_request` and `wc_approve_request`, where Sui requests are `sui_signTransaction`, `sui_signAndExecuteTransaction`, `sui_signPersonalMessage` and `sui_getAccounts`):
+Connect: copy the `wc:` URI from the dapp, then pair, check the proposal and approve it with the wallet name, chain ID and password (a Sui or Solana wallet leaves out `chain_id`: `"arguments":{"proposal_id":"<id>","wallet_name":"DemoSui","password":"demo-password-123"}`; use the same shape for `wc_review_request` and `wc_approve_request`, where Sui requests are `sui_signTransaction`, `sui_signAndExecuteTransaction`, `sui_signPersonalMessage` and `sui_getAccounts`):
 
 ```bash
 printf '%s\n' \
@@ -531,6 +565,84 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"view_priva
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_networks","arguments":{"wallet_name":"Sui Demo","password":"demo-password-123"}}}' | cargo run -q
 ```
 
+### Solana wallets
+
+Solana wallets use the same tools; there is no `chain_id` (the wallet is bound to the cluster it was created for). Create one (mainnet by default; add `"network":"devnet"` for a test wallet):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_wallet","arguments":{"blockchain":"solana","wallet_name":"Sol Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_wallet","arguments":{"blockchain":"solana","wallet_name":"Sol Devnet","password":"demo-password-123","network":"devnet"}}}' | cargo run -q
+```
+
+Import a seed phrase (24 words, derived at `m/44'/501'/0'/0'` like Phantom; the well-known public test phrase below must never be used for real funds) or the base58 private key Phantom or Solflare shows:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"import_wallet","arguments":{"blockchain":"solana","wallet_name":"Sol Imported","password":"import-password-1","seed_phrase":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"import_wallet","arguments":{"blockchain":"solana","wallet_name":"Sol Key","password":"import-password-2","private_key":"<base58 private key>"}}}' | cargo run -q
+```
+
+SOL and every token the address holds, with USD values on mainnet:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet_balances","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+Estimate and dry-run a transfer, then send it (spends real funds if the wallet is funded; `asset` is `native` for SOL or a token mint address such as USDC's `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`; sending a token opens the recipient's token account if they have none):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"simulate_transaction","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123","asset":"native","amount":"0.1","to":"<recipient address>"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_asset","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123","asset":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","amount":"1.5","to":"<recipient address>"}}}' | cargo run -q
+```
+
+Sign a transaction built elsewhere (a serialized transaction in base64, as web3.js produces it; add `"broadcast":true` to also send it) and a message (Phantom's `signMessage`):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sign_contract_transaction","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123","transaction_bytes":"<base64 transaction>"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sign_personal_message","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123","message":"Sign in to example.app"}}}' | cargo run -q
+```
+
+Look up a transaction by signature, and list recent activity:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_transaction","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123","transaction_hash":"<signature>"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_transaction_history","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123","limit":5}}}' | cargo run -q
+```
+
+Swap through Jupiter (mainnet wallets only; no `from_chain_id` / `to_chain_id`; no API key). Preview first, then swap with the quote's `minimum_amount` as `min_receive`:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_swap_quote","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123","from_token":"native","to_token":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","amount":"0.1"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"swap_tokens","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123","from_token":"native","to_token":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","amount":"0.1","min_receive":"<minimum_amount from the quote>"}}}' | cargo run -q
+```
+
+The key in the format Phantom imports (base58 keypair, plus hex) and the cluster the wallet is bound to:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"view_private_key","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_networks","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
 ### Several requests in one session
 
 Piping multiple lines runs them in one server process (one JSON message per line; notifications get no reply):
@@ -548,7 +660,7 @@ To pretty-print a response, append `| jq` (or `| python3 -m json.tool`) to any c
 
 ## Tips for Agents
 
-Lessons from using WalletConnect with Ethereum and Sui dapps (Sui was tested live against Cetus; the session, polling and expiry rules apply to both chains).
+Lessons from using WalletConnect with Ethereum, Sui and Solana dapps (Sui was tested live against Cetus; Solana was tested against a simulated relay and node only; the session, polling and expiry rules apply to all chains).
 
 - **Keep the server running for the whole dapp session.** WalletConnect sessions and pending requests live only in the memory of the running `agent-saifu-core` process. Dapp requests arrive while it runs. If the process exits or restarts, the session is gone and the dapp must pair again with a fresh `wc:` URI. Start the server once, leave it open, and keep sending tool calls to the same process (for example through a fifo or an MCP client that holds the stdio connection open). Do not run `cargo run` per call for WalletConnect.
 - **A `wc:` URI is single use and short lived.** It expires within minutes and cannot be reused after the server restarts. Ask the user for a new link after any restart, and pair and approve the session right away.

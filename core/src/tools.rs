@@ -129,12 +129,13 @@ fn chain_id() -> Param {
     )
 }
 
-/// For tools that work with both blockchains: Ethereum wallets need it, Sui wallets must omit it.
+/// For tools that work with every blockchain: Ethereum wallets need it, Sui and Solana wallets
+/// must omit it.
 fn chain_id_for_eth() -> Param {
     opt(
         "chain_id",
         Kind::Integer,
-        "Ethereum wallets: chain ID of the network, e.g. 1 (Ethereum), 8453 (Base), 42161 (Arbitrum One); required. Sui wallets: omit (a Sui wallet is bound to the network it was created for).",
+        "Ethereum wallets: chain ID of the network, e.g. 1 (Ethereum), 8453 (Base), 42161 (Arbitrum One); required. Sui and Solana wallets: omit (they are bound to the network they were created for).",
     )
 }
 
@@ -144,10 +145,14 @@ fn eth_chain_id(a: &Args) -> Result<u64, String> {
     })
 }
 
-/// Sui wallets are bound to one network, so a chain ID would be meaningless (or a mistake).
-fn reject_chain_id_for_sui(a: &Args) -> Result<(), String> {
+/// Sui and Solana wallets are bound to one network, so a chain ID would be meaningless (or a
+/// mistake).
+fn reject_chain_id_for(a: &Args, chain: Blockchain) -> Result<(), String> {
     if a.opt_u64("chain_id")?.is_some() {
-        return Err("'chain_id' is for Ethereum wallets; a Sui wallet is bound to the network it was created for (see list_networks)".to_string());
+        return Err(format!(
+            "'chain_id' is for Ethereum wallets; a {} wallet is bound to the network it was created for (see list_networks)",
+            chain.display_name()
+        ));
     }
     Ok(())
 }
@@ -157,7 +162,7 @@ fn intent_params() -> Vec<Param> {
         opt(
             "to",
             Kind::Text,
-            "Recipient address, or the contract to call (Ethereum). Required, except for Sui transaction_bytes.",
+            "Recipient address, or the contract to call (Ethereum). Required, except for Sui and Solana transaction_bytes.",
         ),
         opt(
             "value",
@@ -172,7 +177,7 @@ fn intent_params() -> Vec<Param> {
         opt(
             "asset",
             Kind::Text,
-            "Instead of value/data: \"native\" or a token to transfer (an ERC-20 contract address on Ethereum; a coin type such as 0x2::sui::SUI on Sui).",
+            "Instead of value/data: \"native\" or a token to transfer (an ERC-20 contract address on Ethereum; a coin type such as 0x2::sui::SUI on Sui; a token mint address on Solana).",
         ),
         opt(
             "amount",
@@ -182,7 +187,7 @@ fn intent_params() -> Vec<Param> {
         opt(
             "transaction_bytes",
             Kind::Text,
-            "Sui only: a complete transaction as base64 BCS TransactionData (as built by a dapp or the Sui SDKs), instead of asset + amount + to.",
+            "Sui: a complete transaction as base64 BCS TransactionData (as built by a dapp or the Sui SDKs). Solana: a complete serialized transaction, base64 (as web3.js or a dapp produces it; its signature slots may be empty). Instead of asset + amount + to.",
         ),
     ]
 }
@@ -200,10 +205,10 @@ fn network_params(extra: Vec<Param>) -> Vec<Param> {
     p
 }
 
-/// Sui wallets sign transactions from `transaction_bytes`; Ethereum has no such input.
+/// Sui and Solana wallets sign transactions from `transaction_bytes`; Ethereum has no such input.
 fn reject_transaction_bytes(a: &Args) -> Result<(), String> {
     if a.opt_str("transaction_bytes")?.is_some() {
-        return Err("'transaction_bytes' is for Sui wallets".to_string());
+        return Err("'transaction_bytes' is for Sui and Solana wallets".to_string());
     }
     Ok(())
 }
@@ -230,7 +235,7 @@ fn intent_from(a: &Args) -> Result<IntentParams, String> {
     })
 }
 
-/// Ethereum swap parameters need chain IDs; Sui swaps leave them out.
+/// Ethereum swap parameters need chain IDs; Sui and Solana swaps leave them out.
 fn swap_params(a: &Args, with_min_receive: bool) -> Result<SwapParams, String> {
     Ok(SwapParams {
         from_chain_id: a.opt_u64("from_chain_id")?.unwrap_or(0),
@@ -255,22 +260,22 @@ fn swap_inputs(with_min_receive: bool) -> Vec<Param> {
         opt(
             "from_chain_id",
             Kind::Integer,
-            "Ethereum wallets (required): chain ID of the network the token you are selling is on; the wallet must have this network. Sui wallets: omit.",
+            "Ethereum wallets (required): chain ID of the network the token you are selling is on; the wallet must have this network. Sui and Solana wallets: omit.",
         ),
         req(
             "from_token",
             Kind::Text,
-            "The token to sell: \"native\" for the network's coin (ETH, SUI), an ERC-20 contract address on Ethereum, or a coin type such as 0xdba3...::usdc::USDC on Sui.",
+            "The token to sell: \"native\" for the network's coin (ETH, SUI, SOL), an ERC-20 contract address on Ethereum, a coin type such as 0xdba3...::usdc::USDC on Sui, or a token mint address on Solana.",
         ),
         opt(
             "to_chain_id",
             Kind::Integer,
-            "Ethereum wallets (required): chain ID of the network to receive on. Must equal from_chain_id: OpenOcean only swaps within one chain, so cross-chain swaps are not supported. Sui wallets: omit.",
+            "Ethereum wallets (required): chain ID of the network to receive on. Must equal from_chain_id: OpenOcean only swaps within one chain, so cross-chain swaps are not supported. Sui and Solana wallets: omit.",
         ),
         req(
             "to_token",
             Kind::Text,
-            "The token to receive: \"native\", an ERC-20 contract address (Ethereum) or a coin type (Sui).",
+            "The token to receive: \"native\", an ERC-20 contract address (Ethereum), a coin type (Sui) or a token mint address (Solana).",
         ),
         req(
             "amount",
@@ -285,7 +290,7 @@ fn swap_inputs(with_min_receive: bool) -> Vec<Param> {
         opt(
             "to_address",
             Kind::Text,
-            "Send the bought tokens to this address on the same chain instead of to the wallet itself.",
+            "Send the bought tokens to this address on the same chain instead of to the wallet itself (Ethereum and Sui; not supported on Solana).",
         ),
     ];
     if with_min_receive {
@@ -319,12 +324,12 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "create_wallet",
-            description: "Create a new wallet with a fresh 24-word seed phrase, stored in a password-encrypted vault (PBKDF2-SHA256 + AES-256-GCM, like MetaMask). Works for Ethereum and Sui. Several wallets can exist; wallet names are unique. Returns the public address. Use view_seed_phrase to back it up. A Sui wallet (Ed25519, derivation m/44'/784'/0'/0'/0') is bound to one network, mainnet by default.",
+            description: "Create a new wallet with a fresh 24-word seed phrase, stored in a password-encrypted vault (PBKDF2-SHA256 + AES-256-GCM, like MetaMask). Works for Ethereum, Sui and Solana. Several wallets can exist; wallet names are unique. Returns the public address. Use view_seed_phrase to back it up. A Sui wallet (Ed25519, derivation m/44'/784'/0'/0'/0') and a Solana wallet (Ed25519, derivation m/44'/501'/0'/0', the path Phantom uses) are each bound to one network, mainnet by default.",
             params: vec![
                 req(
                     "blockchain",
                     Kind::Text,
-                    "Blockchain to create the wallet on: \"ethereum\" or \"sui\".",
+                    "Blockchain to create the wallet on: \"ethereum\", \"sui\" or \"solana\".",
                 ),
                 req(
                     "wallet_name",
@@ -339,7 +344,7 @@ fn definitions() -> Vec<Tool> {
                 opt(
                     "network",
                     Kind::Text,
-                    "Sui only: the network the wallet is bound to, \"mainnet\" (default), \"testnet\" or \"devnet\". Keep test keys separate from mainnet keys by creating separate wallets.",
+                    "Sui and Solana only: the network the wallet is bound to, \"mainnet\" (default), \"testnet\" or \"devnet\" (Solana: \"devnet\" or \"testnet\" are Solana's test clusters). Keep test keys separate from mainnet keys by creating separate wallets.",
                 ),
             ],
             handler: |s, a| {
@@ -353,12 +358,12 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "import_wallet",
-            description: "Add an existing wallet from a 24-word seed phrase or a private key (Ethereum or Sui). Provide exactly one of seed_phrase or private_key. The secret is stored only inside a password-encrypted vault.",
+            description: "Add an existing wallet from a 24-word seed phrase or a private key (Ethereum, Sui or Solana). Provide exactly one of seed_phrase or private_key. The secret is stored only inside a password-encrypted vault.",
             params: vec![
                 opt(
                     "blockchain",
                     Kind::Text,
-                    "Blockchain of the wallet: \"ethereum\" (default) or \"sui\".",
+                    "Blockchain of the wallet: \"ethereum\" (default), \"sui\" or \"solana\".",
                 ),
                 req("wallet_name", Kind::Text, "Unique name for the wallet."),
                 req(
@@ -370,12 +375,12 @@ fn definitions() -> Vec<Tool> {
                 opt(
                     "private_key",
                     Kind::Text,
-                    "Ethereum: hex private key (with or without 0x). Sui: a suiprivkey1... string (as shown by Sui wallets and the Sui CLI), or 64 hex characters; Ed25519 only.",
+                    "Ethereum: hex private key (with or without 0x). Sui: a suiprivkey1... string (as shown by Sui wallets and the Sui CLI), or 64 hex characters; Ed25519 only. Solana: the base58 private key that Phantom or Solflare export, a Solana CLI keypair file's byte list ([12,34,...]), or hex of the 32-byte secret.",
                 ),
                 opt(
                     "network",
                     Kind::Text,
-                    "Sui only: the network the wallet is bound to, \"mainnet\" (default), \"testnet\" or \"devnet\".",
+                    "Sui and Solana only: the network the wallet is bound to, \"mainnet\" (default), \"testnet\" or \"devnet\".",
                 ),
             ],
             handler: |s, a| {
@@ -429,13 +434,13 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "get_wallet_address",
-            description: "Show a wallet's public address (Ethereum or Sui).",
+            description: "Show a wallet's public address (Ethereum, Sui or Solana).",
             params: vec![wallet(), password()],
             handler: |s, a| s.get_address(a.str("wallet_name")?, a.str("password")?),
         },
         Tool {
             name: "get_wallet_balances",
-            description: "Show a wallet's assets: each asset's symbol, amount held, and USDC value. Ethereum wallets: every network the wallet uses (or one chain), with chain IDs; checks the native coin, well-known tokens, tokens added with add_token, and any token_contracts you list. Sui wallets: every coin type the address holds (coin objects and address balance combined) on the wallet's network.",
+            description: "Show a wallet's assets: each asset's symbol, amount held, and USDC value. Ethereum wallets: every network the wallet uses (or one chain), with chain IDs; checks the native coin, well-known tokens, tokens added with add_token, and any token_contracts you list. Sui wallets: every coin type the address holds (coin objects and address balance combined) on the wallet's network. Solana wallets: SOL and every SPL Token / Token-2022 token the address holds on the wallet's network.",
             params: vec![
                 wallet(),
                 password(),
@@ -452,12 +457,19 @@ fn definitions() -> Vec<Tool> {
             ],
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, pw)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
+                let chain = s.chain_of(name, pw)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
                     if !a.str_list("token_contracts")?.is_empty() {
-                        return Err("token_contracts is an Ethereum option; a Sui wallet lists every coin it holds".to_string());
+                        return Err(format!(
+                            "token_contracts is an Ethereum option; a {} wallet lists every token it holds",
+                            chain.display_name()
+                        ));
                     }
-                    return s.sui_balances(name, pw);
+                    return match chain {
+                        Blockchain::Solana => s.solana_balances(name, pw),
+                        _ => s.sui_balances(name, pw),
+                    };
                 }
                 let chain = a.opt_u64("chain_id")?;
                 let tokens = a.str_list("token_contracts")?;
@@ -473,7 +485,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "send_asset",
-            description: "Send the native coin or a token (an ERC-20 on Ethereum; SUI or any coin type on Sui) to another address and broadcast the transaction. Irreversible. Use simulate_transaction first when unsure. A Sui transfer is dry-run before it is signed. Returns the transaction hash (Ethereum) or digest (Sui).",
+            description: "Send the native coin or a token (an ERC-20 on Ethereum; SUI or any coin type on Sui; SOL or any SPL / Token-2022 token on Solana) to another address and broadcast the transaction. Irreversible. Use simulate_transaction first when unsure. Sui and Solana transfers are dry-run before they are signed. Returns the transaction hash (Ethereum), digest (Sui) or signature (Solana).",
             params: vec![
                 wallet(),
                 password(),
@@ -481,12 +493,12 @@ fn definitions() -> Vec<Tool> {
                 req(
                     "asset",
                     Kind::Text,
-                    "\"native\" for the network's coin, or the token: an ERC-20 contract address (Ethereum) or a coin type such as 0xdba3...::usdc::USDC (Sui).",
+                    "\"native\" for the network's coin, or the token: an ERC-20 contract address (Ethereum), a coin type such as 0xdba3...::usdc::USDC (Sui) or a token mint address such as EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (Solana).",
                 ),
                 req(
                     "to",
                     Kind::Text,
-                    "Recipient address (Sui: 0x plus 64 hex characters, written out in full).",
+                    "Recipient address (Sui: 0x plus 64 hex characters, written out in full; Solana: base58 wallet address. Sending a Solana token opens the recipient's token account if they have none, paid by this wallet).",
                 ),
                 req(
                     "amount",
@@ -501,18 +513,20 @@ fn definitions() -> Vec<Tool> {
             ],
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, pw)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
+                let chain = s.chain_of(name, pw)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
                     if a.opt_u64("gas_limit")?.is_some() {
-                        return Err("'gas_limit' is an Ethereum option; Sui sets the gas budget from a dry run".to_string());
+                        return Err(format!(
+                            "'gas_limit' is an Ethereum option; {} sets its fees itself",
+                            chain.display_name()
+                        ));
                     }
-                    return s.sui_send_asset(
-                        name,
-                        pw,
-                        a.str("asset")?,
-                        a.str("to")?,
-                        a.str("amount")?,
-                    );
+                    let (asset, to, amount) = (a.str("asset")?, a.str("to")?, a.str("amount")?);
+                    return match chain {
+                        Blockchain::Solana => s.solana_send_asset(name, pw, asset, to, amount),
+                        _ => s.sui_send_asset(name, pw, asset, to, amount),
+                    };
                 }
                 s.send_asset(
                     name,
@@ -527,7 +541,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "sign_contract_transaction",
-            description: "Sign a smart-contract transaction. Ethereum: calldata to a contract, optionally with value; known token calls (transfer/approve) are decoded with warnings, e.g. unlimited approvals. Sui: a complete transaction (transaction_bytes, base64 BCS TransactionData, e.g. a Move call built by a dapp or the Sui SDKs); it is decoded, dry-run, and refused unless this wallet is its sender. This is the Wallet Standard sui:signTransaction (broadcast=false) / sui:signAndExecuteTransaction (broadcast=true) equivalent. By default it only signs; set broadcast=true to also send it.",
+            description: "Sign a smart-contract transaction. Ethereum: calldata to a contract, optionally with value; known token calls (transfer/approve) are decoded with warnings, e.g. unlimited approvals. Sui: a complete transaction (transaction_bytes, base64 BCS TransactionData, e.g. a Move call built by a dapp or the Sui SDKs); it is decoded, dry-run, and refused unless this wallet is its sender. This is the Wallet Standard sui:signTransaction (broadcast=false) / sui:signAndExecuteTransaction (broadcast=true) equivalent. Solana: a complete serialized transaction (transaction_bytes, base64, legacy or version 0, e.g. built by a dapp or web3.js); every instruction is decoded in plain language, the transaction is simulated, and it is refused unless this wallet is one of its signers and its blockhash is valid on the wallet's network (the solana:signTransaction / signAndSendTransaction equivalent). By default it only signs; set broadcast=true to also send it.",
             params: {
                 let mut p = vec![wallet(), password(), chain_id_for_eth()];
                 p.extend(intent_params());
@@ -545,8 +559,9 @@ fn definitions() -> Vec<Tool> {
             },
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, pw)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
+                let chain = s.chain_of(name, pw)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
                     let params = intent_from(a)?;
                     if params.to.is_some()
                         || params.value.is_some()
@@ -555,16 +570,24 @@ fn definitions() -> Vec<Tool> {
                         || params.amount.is_some()
                         || a.opt_u64("gas_limit")?.is_some()
                     {
-                        return Err("for a Sui wallet give only transaction_bytes (and broadcast); to, value, data, asset, amount and gas_limit are Ethereum options (use send_asset to build a Sui transfer)".to_string());
+                        return Err(format!(
+                            "for a {} wallet give only transaction_bytes (and broadcast); to, value, data, asset, amount and gas_limit are Ethereum options (use send_asset to build a transfer)",
+                            chain.display_name()
+                        ));
                     }
-                    let bytes = params.transaction_bytes.as_deref().ok_or(
-                        "missing required argument 'transaction_bytes' (required for Sui wallets)",
-                    )?;
-                    return s.sui_sign_transaction(name, pw, bytes, a.bool_or("broadcast", false)?);
+                    let bytes = params.transaction_bytes.as_deref().ok_or_else(|| {
+                        format!(
+                            "missing required argument 'transaction_bytes' (required for {} wallets)",
+                            chain.display_name()
+                        )
+                    })?;
+                    let broadcast = a.bool_or("broadcast", false)?;
+                    return match chain {
+                        Blockchain::Solana => s.solana_sign_transaction(name, pw, bytes, broadcast),
+                        _ => s.sui_sign_transaction(name, pw, bytes, broadcast),
+                    };
                 }
-                if a.opt_str("transaction_bytes")?.is_some() {
-                    return Err("'transaction_bytes' is for Sui wallets".to_string());
-                }
+                reject_transaction_bytes(a)?;
                 s.sign_contract_transaction(
                     name,
                     pw,
@@ -577,7 +600,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "sign_personal_message",
-            description: "Sign a message (the Wallet Standard sui:signPersonalMessage / personal_sign equivalent), e.g. to prove ownership of an address to a service. Ethereum: EIP-191 personal_sign. Sui: Sui's personal-message intent, so the signature can never be replayed as a transaction. Nothing is sent. Only sign messages you understand.",
+            description: "Sign a message (the Wallet Standard sui:signPersonalMessage / personal_sign / Solana signMessage equivalent), e.g. to prove ownership of an address to a service. Ethereum: EIP-191 personal_sign. Sui: Sui's personal-message intent, so the signature can never be replayed as a transaction. Solana: a raw Ed25519 signature over the message bytes, as Phantom's signMessage does; bytes that are a valid Solana transaction are refused. Nothing is sent. Only sign messages you understand.",
             params: vec![
                 wallet(),
                 password(),
@@ -594,12 +617,13 @@ fn definitions() -> Vec<Tool> {
                 match s.chain_of(name, pw)? {
                     Blockchain::Sui => s.sui_sign_message(name, pw, message, format),
                     Blockchain::Ethereum => s.eth_sign_message(name, pw, message, format),
+                    Blockchain::Solana => s.solana_sign_message(name, pw, message, format),
                 }
             },
         },
         Tool {
             name: "estimate_gas_fee",
-            description: "Estimate the gas and fee (in native currency and USDC) for a transaction: a transfer (asset+amount) or, on Ethereum, a contract call (data, value); on Sui, a transfer or given transaction_bytes. Nothing is signed or sent.",
+            description: "Estimate the fee (in native currency and USDC) for a transaction: a transfer (asset+amount) or, on Ethereum, a contract call (data, value); on Sui and Solana, a transfer or given transaction_bytes. Nothing is signed or sent.",
             params: {
                 let mut p = vec![wallet(), password(), chain_id_for_eth()];
                 p.extend(intent_params());
@@ -607,9 +631,14 @@ fn definitions() -> Vec<Tool> {
             },
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, pw)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
-                    return s.sui_estimate_gas(name, pw, &intent_from(a)?);
+                let chain = s.chain_of(name, pw)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
+                    let params = intent_from(a)?;
+                    return match chain {
+                        Blockchain::Solana => s.solana_estimate_gas(name, pw, &params),
+                        _ => s.sui_estimate_gas(name, pw, &params),
+                    };
                 }
                 reject_transaction_bytes(a)?;
                 s.estimate_gas(name, pw, eth_chain_id(a)?, &intent_from(a)?)
@@ -617,7 +646,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "simulate_transaction",
-            description: "Dry-run a transaction against current chain state before signing: whether it would succeed or revert/fail (with reason), gas, fees, and what it would do. Ethereum: also whether the wallet can afford it and a decoded description of token transfers/approvals. Sui: the wallet's balance changes. Nothing is signed or sent.",
+            description: "Dry-run a transaction against current chain state before signing: whether it would succeed or revert/fail (with reason), fees, and what it would do. Ethereum: also whether the wallet can afford it and a decoded description of token transfers/approvals. Sui and Solana: the wallet's balance changes (Solana: every instruction decoded when transaction_bytes is given). Nothing is signed or sent.",
             params: {
                 let mut p = vec![wallet(), password(), chain_id_for_eth()];
                 p.extend(intent_params());
@@ -625,9 +654,14 @@ fn definitions() -> Vec<Tool> {
             },
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, pw)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
-                    return s.sui_simulate_transaction(name, pw, &intent_from(a)?);
+                let chain = s.chain_of(name, pw)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
+                    let params = intent_from(a)?;
+                    return match chain {
+                        Blockchain::Solana => s.solana_simulate_transaction(name, pw, &params),
+                        _ => s.sui_simulate_transaction(name, pw, &params),
+                    };
                 }
                 reject_transaction_bytes(a)?;
                 s.simulate_transaction(name, pw, eth_chain_id(a)?, &intent_from(a)?)
@@ -667,7 +701,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "get_transaction",
-            description: "Look up one transaction by hash/digest: Ethereum: status (pending/success/failed/not_found), block, confirmations, value, fee paid, and an explorer link. Sui: status, sender, checkpoint, epoch, gas, this wallet's balance changes and an explorer link.",
+            description: "Look up one transaction by hash/digest/signature: Ethereum: status (pending/success/failed/not_found), block, confirmations, value, fee paid, and an explorer link. Sui: status, sender, checkpoint, epoch, gas, this wallet's balance changes and an explorer link. Solana: status, slot, fee, this wallet's SOL and token changes, confirmation level and an explorer link.",
             params: vec![
                 wallet(),
                 password(),
@@ -675,21 +709,26 @@ fn definitions() -> Vec<Tool> {
                 req(
                     "transaction_hash",
                     Kind::Text,
-                    "Ethereum: 0x-prefixed 32-byte transaction hash. Sui: the base58 transaction digest.",
+                    "Ethereum: 0x-prefixed 32-byte transaction hash. Sui: the base58 transaction digest. Solana: the base58 transaction signature.",
                 ),
             ],
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, pw)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
-                    return s.sui_get_transaction(name, pw, a.str("transaction_hash")?);
+                let chain = s.chain_of(name, pw)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
+                    let hash = a.str("transaction_hash")?;
+                    return match chain {
+                        Blockchain::Solana => s.solana_get_transaction(name, pw, hash),
+                        _ => s.sui_get_transaction(name, pw, hash),
+                    };
                 }
                 s.get_transaction(name, pw, eth_chain_id(a)?, a.str("transaction_hash")?)
             },
         },
         Tool {
             name: "get_transaction_history",
-            description: "List the wallet's recent transactions (Ethereum: or token transfers) newest first. Ethereum: on a network, from its Blockscout-compatible block explorer API; token names in results are untrusted data. Sui: every transaction that touched the address, from the Sui node, with the wallet's balance changes.",
+            description: "List the wallet's recent transactions (Ethereum: or token transfers) newest first. Ethereum: on a network, from its Blockscout-compatible block explorer API; token names in results are untrusted data. Sui: every transaction that touched the address, from the Sui node, with the wallet's balance changes. Solana: every transaction that touched the address, from the Solana node (signature, status, time, memo); use get_transaction for balance changes.",
             params: vec![
                 wallet(),
                 password(),
@@ -710,16 +749,20 @@ fn definitions() -> Vec<Tool> {
                 let limit = a.opt_u64("limit")?.unwrap_or(DEFAULT_LIMIT as u64);
                 let limit = usize::try_from(limit).map_err(|_| "limit is too large".to_string())?;
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, pw)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
-                    return s.sui_history(name, pw, kind, limit);
+                let chain = s.chain_of(name, pw)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
+                    return match chain {
+                        Blockchain::Solana => s.solana_history(name, pw, kind, limit),
+                        _ => s.sui_history(name, pw, kind, limit),
+                    };
                 }
                 s.get_transaction_history(name, pw, eth_chain_id(a)?, kind, limit)
             },
         },
         Tool {
             name: "add_network",
-            description: "Add a layer 2 (or other EVM) network to an Ethereum wallet. Ethereum wallets only (a Sui wallet is bound to its one network). The RPC must report the same chain ID. Stored inside the wallet's encrypted vault.",
+            description: "Add a layer 2 (or other EVM) network to an Ethereum wallet. Ethereum wallets only (Sui and Solana wallets are bound to their one network, and Solana has no layer 2s to add). The RPC must report the same chain ID. Stored inside the wallet's encrypted vault.",
             params: network_params(vec![]),
             handler: |s, a| {
                 s.add_network(a.str("wallet_name")?, a.str("password")?, network_from(a)?)
@@ -747,13 +790,14 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "get_swap_quote",
-            description: "Preview a swap before doing it, with nothing signed or sent: how much of the new token you would get (expected and guaranteed minimum), the fees, the route, price impact/deviation, and whether more balance is needed. Ethereum wallets: powered by OpenOcean (service fee of 0.7% of the amount sold; estimated network fee; whether an approval is needed); needs no API key; within one chain only, so to_chain_id must equal from_chain_id. Sui wallets (mainnet): powered by the Cetus aggregator (routes over Cetus pools only; the route is verified against Cetus's on-chain packages and the transaction is dry-run); the service fee is taken from the coins produced.",
+            description: "Preview a swap before doing it, with nothing signed or sent: how much of the new token you would get (expected and guaranteed minimum), the fees, the route, price impact/deviation, and whether more balance is needed. Ethereum wallets: powered by OpenOcean (service fee of 0.7% of the amount sold; estimated network fee; whether an approval is needed); needs no API key; within one chain only, so to_chain_id must equal from_chain_id. Sui wallets (mainnet): powered by the Cetus aggregator (routes over Cetus pools only; the route is verified against Cetus's on-chain packages and the transaction is dry-run); the service fee is taken from the coins produced. Solana wallets (mainnet): powered by Jupiter (keyless, no API key); the wallet assembles the transaction from Jupiter's swap instructions, checks it and simulates it, and the quote is only reported if the simulation shows the wallet spends no more than requested and receives at least minimum_amount. The service fee is taken from the tokens bought.",
             params: swap_inputs(false),
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
                 let params = swap_params(a, false)?;
                 match s.chain_of(name, pw)? {
                     Blockchain::Sui => s.sui_swap_quote(name, pw, &params),
+                    Blockchain::Solana => s.solana_swap_quote(name, pw, &params),
                     Blockchain::Ethereum => {
                         require_swap_chain_ids(a)?;
                         s.get_swap_quote(name, pw, &params)
@@ -763,13 +807,14 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "swap_tokens",
-            description: "Swap one token for another on one chain and broadcast it. Irreversible. Call get_swap_quote first and pass its minimum_amount as min_receive. Ethereum: through OpenOcean; if the sold token needs an approval, exactly the sold amount is approved first (and confirmed) before the swap is sent; cross-chain swaps are not supported. Sui (mainnet): through the Cetus aggregator in one transaction whose contract aborts it on-chain if the result would be below the minimum; it is dry-run before signing. Returns the transaction hash/digest.",
+            description: "Swap one token for another on one chain and broadcast it. Irreversible. Call get_swap_quote first and pass its minimum_amount as min_receive. Ethereum: through OpenOcean; if the sold token needs an approval, exactly the sold amount is approved first (and confirmed) before the swap is sent; cross-chain swaps are not supported. Sui (mainnet): through the Cetus aggregator in one transaction whose contract aborts it on-chain if the result would be below the minimum; it is dry-run before signing. Solana (mainnet): through Jupiter; the transaction is signed only after a simulation shows the wallet spends no more than requested, receives at least the quoted minimum and loses nothing else. Returns the transaction hash/digest/signature.",
             params: swap_inputs(true),
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
                 let params = swap_params(a, true)?;
                 match s.chain_of(name, pw)? {
                     Blockchain::Sui => s.sui_swap_tokens(name, pw, &params),
+                    Blockchain::Solana => s.solana_swap_tokens(name, pw, &params),
                     Blockchain::Ethereum => {
                         require_swap_chain_ids(a)?;
                         s.swap_tokens(name, pw, &params)
@@ -779,7 +824,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "add_token",
-            description: "Add an ERC-20 token to an Ethereum wallet on a network, by contract address, so it always appears in get_wallet_balances (even at zero). Ethereum wallets only (a Sui wallet lists every coin it holds automatically). The contract is checked on-chain (decimals and symbol are read from it). Stored inside the wallet's encrypted vault; up to 50 added tokens per network.",
+            description: "Add an ERC-20 token to an Ethereum wallet on a network, by contract address, so it always appears in get_wallet_balances (even at zero). Ethereum wallets only (Sui and Solana wallets list every coin or token they hold automatically). The contract is checked on-chain (decimals and symbol are read from it). Stored inside the wallet's encrypted vault; up to 50 added tokens per network.",
             params: vec![
                 wallet(),
                 password(),
@@ -819,7 +864,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "list_networks",
-            description: "List the networks a wallet can use with their URLs. Ethereum: built-in and custom networks with chain IDs and RPC/explorer URLs. Sui: the one network the wallet is bound to.",
+            description: "List the networks a wallet can use with their URLs. Ethereum: built-in and custom networks with chain IDs and RPC/explorer URLs. Sui and Solana: the one network the wallet is bound to.",
             params: vec![wallet(), password()],
             handler: |s, a| s.view_networks(a.str("wallet_name")?, a.str("password")?),
         },
@@ -831,7 +876,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "view_private_key",
-            description: "Reveal a wallet's private key (Sui: as a suiprivkey1... string, plus hex). Sensitive: anyone who sees it controls the wallet.",
+            description: "Reveal a wallet's private key (Sui: as a suiprivkey1... string, plus hex; Solana: as the base58 keypair that Phantom and Solflare import, plus the 32-byte secret in hex). Sensitive: anyone who sees it controls the wallet.",
             params: vec![wallet(), password()],
             handler: |s, a| s.view_private_key(a.str("wallet_name")?, a.str("password")?),
         },
@@ -889,7 +934,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "wc_pair",
-            description: "Connect to a dapp with WalletConnect (Ethereum dapps with an Ethereum wallet, and Sui dapps with a Sui wallet; the Sui methods are sui_getAccounts, sui_signTransaction, sui_signAndExecuteTransaction and sui_signPersonalMessage). Give it the connection URI the dapp shows (starts with \"wc:\"; the text behind its QR code). Waits for the dapp's session proposal and returns what the dapp is asking for. Nothing is connected until you call wc_approve_session. No wallet is unlocked.",
+            description: "Connect to a dapp with WalletConnect (Ethereum dapps with an Ethereum wallet, Sui dapps with a Sui wallet, and Solana dapps with a Solana wallet; the Sui methods are sui_getAccounts, sui_signTransaction, sui_signAndExecuteTransaction and sui_signPersonalMessage; the Solana methods are solana_getAccounts, solana_requestAccounts, solana_signMessage, solana_signTransaction, solana_signAndSendTransaction and solana_signAllTransactions). Give it the connection URI the dapp shows (starts with \"wc:\"; the text behind its QR code). Waits for the dapp's session proposal and returns what the dapp is asking for. Nothing is connected until you call wc_approve_session. No wallet is unlocked.",
             params: vec![
                 req(
                     "uri",
@@ -912,7 +957,7 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "wc_approve_session",
-            description: "Approve a dapp's connection proposal with an Ethereum or a Sui wallet (wc_list_proposals shows which the dapp can use). This reveals the wallet's address to the dapp, so it needs the wallet name and the password. Sui wallets: omit chain_id and additional_chain_ids; the dapp is connected on the wallet's own network (e.g. sui:mainnet), which the dapp must accept, and the Sui methods it asked for are granted (sui_signTransaction, sui_signAndExecuteTransaction, sui_signPersonalMessage, and sui_getAccounts). Ethereum wallets: chain_id plus additional_chain_ids must cover every chain the dapp requires (see wc_list_proposals) and may only include chains the dapp asked for; the wallet must have a network for each. Only the methods this wallet supports are granted (transactions, personal_sign, typed data); eth_sign is never granted.",
+            description: "Approve a dapp's connection proposal with an Ethereum, a Sui or a Solana wallet (wc_list_proposals shows which the dapp can use). This reveals the wallet's address to the dapp, so it needs the wallet name and the password. Sui and Solana wallets: omit chain_id and additional_chain_ids; the dapp is connected on the wallet's own network (e.g. sui:mainnet, or solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp for Solana mainnet), which the dapp must accept, and the methods it asked for that this wallet supports are granted (Sui: sui_signTransaction, sui_signAndExecuteTransaction, sui_signPersonalMessage and sui_getAccounts; Solana: solana_signMessage, solana_signTransaction, solana_signAndSendTransaction, solana_signAllTransactions, solana_getAccounts and solana_requestAccounts). Ethereum wallets: chain_id plus additional_chain_ids must cover every chain the dapp requires (see wc_list_proposals) and may only include chains the dapp asked for; the wallet must have a network for each. Only the methods this wallet supports are granted (transactions, personal_sign, typed data); eth_sign is never granted.",
             params: vec![
                 req(
                     "proposal_id",
@@ -924,7 +969,7 @@ fn definitions() -> Vec<Tool> {
                 opt(
                     "additional_chain_ids",
                     Kind::TextList,
-                    "Further chain IDs to share with the dapp (required by it or optional).",
+                    "Further chain IDs to share with the dapp (required by it or optional). Ethereum wallets only.",
                 ),
                 password(),
             ],
@@ -939,12 +984,20 @@ fn definitions() -> Vec<Tool> {
                     })
                     .collect::<Result<Vec<u64>, String>>()?;
                 let (name, password) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, password)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
+                let chain = s.chain_of(name, password)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
                     if !extra.is_empty() {
-                        return Err("'additional_chain_ids' is for Ethereum wallets; a Sui wallet is bound to one network".to_string());
+                        return Err(format!(
+                            "'additional_chain_ids' is for Ethereum wallets; a {} wallet is bound to one network",
+                            chain.display_name()
+                        ));
                     }
-                    return s.wc_approve_session_sui(a.u64("proposal_id")?, name, password);
+                    let proposal = a.u64("proposal_id")?;
+                    return match chain {
+                        Blockchain::Solana => s.wc_approve_session_solana(proposal, name, password),
+                        _ => s.wc_approve_session_sui(proposal, name, password),
+                    };
                 }
                 s.wc_approve_session(
                     a.u64("proposal_id")?,
@@ -983,13 +1036,13 @@ fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "wc_list_requests",
-            description: "List the requests connected dapps are waiting on: transactions to send or sign, messages and typed data to sign, and Sui account queries. Shows the dapp, method, chain and a summary. Use wc_review_request for the full costs and expected outcome. Requests expire after about 5 minutes.",
+            description: "List the requests connected dapps are waiting on: transactions to send or sign, messages and typed data to sign, and Sui and Solana account queries. Shows the dapp, method, chain and a summary. Use wc_review_request for the full costs and expected outcome. Requests expire after about 5 minutes.",
             params: vec![],
             handler: |s, _| s.wc_list_requests(),
         },
         Tool {
             name: "wc_review_request",
-            description: "Review a dapp request before answering it. Unlocks the wallet for this call. For transactions it dry-runs the transaction and reports whether it would succeed, what it sends or approves (token transfers and approvals are decoded), the network fee and whether the wallet can afford it. For messages and typed data it shows exactly what would be signed, with warnings. Signs and sends nothing. Sui wallets: omit chain_id; the dry run, decoded commands and balance changes are shown for sui_signTransaction and sui_signAndExecuteTransaction.",
+            description: "Review a dapp request before answering it. Unlocks the wallet for this call. For transactions it dry-runs the transaction and reports whether it would succeed, what it sends or approves (token transfers and approvals are decoded), the network fee and whether the wallet can afford it. For messages and typed data it shows exactly what would be signed, with warnings. Signs and sends nothing. Sui and Solana wallets: omit chain_id; the dry run, decoded commands or instructions and balance changes are shown for transaction requests.",
             params: vec![
                 req(
                     "request_id",
@@ -1002,16 +1055,21 @@ fn definitions() -> Vec<Tool> {
             ],
             handler: |s, a| {
                 let (name, password) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, password)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
-                    return s.wc_review_request_sui(a.u64("request_id")?, name, password);
+                let chain = s.chain_of(name, password)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
+                    let request = a.u64("request_id")?;
+                    return match chain {
+                        Blockchain::Solana => s.wc_review_request_solana(request, name, password),
+                        _ => s.wc_review_request_sui(request, name, password),
+                    };
                 }
                 s.wc_review_request(a.u64("request_id")?, name, eth_chain_id(a)?, password)
             },
         },
         Tool {
             name: "wc_approve_request",
-            description: "Approve a dapp request: sign it and send the answer back to the dapp. eth_sendTransaction is signed AND BROADCAST (spends funds); eth_signTransaction only signs; personal_sign and typed data produce a signature. The wallet name must be the wallet the dapp is connected to, and (Ethereum) chain_id must be the request's chain. Review the request first with wc_review_request. A transaction that would fail is not sent. Sui wallets: omit chain_id; sui_signTransaction returns {signature, transactionBytes}, sui_signAndExecuteTransaction signs AND SUBMITS and returns {digest}, sui_signPersonalMessage returns {signature}, and sui_getAccounts returns the wallet's address and public key. The request must be for the wallet's own network and name its address.",
+            description: "Approve a dapp request: sign it and send the answer back to the dapp. eth_sendTransaction is signed AND BROADCAST (spends funds); eth_signTransaction only signs; personal_sign and typed data produce a signature. The wallet name must be the wallet the dapp is connected to, and (Ethereum) chain_id must be the request's chain. Review the request first with wc_review_request. A transaction that would fail is not sent. Sui wallets: omit chain_id; sui_signTransaction returns {signature, transactionBytes}, sui_signAndExecuteTransaction signs AND SUBMITS and returns {digest}, sui_signPersonalMessage returns {signature}, and sui_getAccounts returns the wallet's address and public key. The request must be for the wallet's own network and name its address. Solana wallets: omit chain_id; solana_signTransaction returns {signature, transaction}, solana_signAllTransactions returns {transactions}, solana_signAndSendTransaction signs AND SUBMITS and returns {signature}, solana_signMessage returns {signature} (base58; bytes that form a valid transaction are refused), and solana_getAccounts / solana_requestAccounts return the wallet's address. The request must be for the wallet's own Solana network.",
             params: vec![
                 req(
                     "request_id",
@@ -1024,9 +1082,14 @@ fn definitions() -> Vec<Tool> {
             ],
             handler: |s, a| {
                 let (name, password) = (a.str("wallet_name")?, a.str("password")?);
-                if s.chain_of(name, password)? == Blockchain::Sui {
-                    reject_chain_id_for_sui(a)?;
-                    return s.wc_approve_request_sui(a.u64("request_id")?, name, password);
+                let chain = s.chain_of(name, password)?;
+                if chain != Blockchain::Ethereum {
+                    reject_chain_id_for(a, chain)?;
+                    let request = a.u64("request_id")?;
+                    return match chain {
+                        Blockchain::Solana => s.wc_approve_request_solana(request, name, password),
+                        _ => s.wc_approve_request_sui(request, name, password),
+                    };
                 }
                 s.wc_approve_request(a.u64("request_id")?, name, eth_chain_id(a)?, password)
             },

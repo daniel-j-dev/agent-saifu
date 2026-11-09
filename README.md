@@ -18,7 +18,7 @@ Built from the ground up in Rust. Driven entirely through MCP.
 | Ethereum | ✅ Fully covered |
 | ETH Layer 2s (Base, Arbitrum, Optimism and any EVM network you add) | ✅ Fully covered |
 | Sui (mainnet, testnet, devnet; swaps on mainnet via Cetus) | ✅ Fully Covered |
-| Solana | 🔜 Soon |
+| Solana (mainnet, devnet, testnet; swaps on mainnet via Jupiter) | ✅ Fully Covered |
 | Bitcoin | 🔜 Soon |
 
 <br>
@@ -46,7 +46,7 @@ Preview a swap, compare routes through OpenOcean, and submit it. The wallet deco
   <img src="promo-images/02-best-price-swap.svg" alt="OpenOcean compares same-chain exchange quotes, selects the best quoted output, and submits the swap" width="860">
 </p>
 
-## Connect to any dapp (Ethereum & Sui)
+## Connect to any dapp (Ethereum, Sui & Solana)
 
 Pair with Uniswap, OpenSea, Aave and more over WalletConnect v2. The agent reviews every proposal and request before anything is approved or signed.
 
@@ -125,9 +125,10 @@ Having problems? If your agent is confused about anything, remind it to read the
 - **Multiple wallets:** create or import wallets, each with its own password, networks and tokens.
 - **Ethereum and layer 2s:** add custom networks per wallet and check balances across all of them, with USDC values.
 - **Sui:** create or import Ed25519 wallets (the same 24-word phrases and `suiprivkey` keys as Slush and the Sui CLI), bound to mainnet, testnet or devnet, built on the official Sui Rust SDK. Send any coin, sign transactions and messages (Wallet Standard equivalents), and swap through the Cetus aggregator.
+- **Solana:** create or import Ed25519 wallets following Phantom (the same 24-word phrases at `m/44'/501'/0'/0'`, and the same base58 private keys), bound to mainnet, devnet or testnet. Send SOL and any SPL or Token-2022 token, sign transactions (decoded and simulated first) and messages, and swap through Jupiter. Solana has no layer 2s to add.
 - **Safe transactions:** estimate fees, simulate before signing, decode approvals, and revoke them when finished.
-- **Token swaps:** quotes and swaps through OpenOcean (Ethereum) and Cetus (Sui), with local verification and slippage protection.
-- **WalletConnect v2:** connect to any dapp (Ethereum or Sui), review the expected outcome of each request, then approve or reject it.
+- **Token swaps:** quotes and swaps through OpenOcean (Ethereum), Jupiter (Solana, keyless) and Cetus (Sui), with local verification and slippage protection.
+- **WalletConnect v2:** connect to any dapp (Ethereum, Sui or Solana), review the expected outcome of each request, then approve or reject it.
 - **No double payments:** signed transactions are recorded before broadcast, so a lost response is never paid twice.
 - **Minimal dependencies:** hashing, ABI, RLP, EIP-712, BIP32/39 and WalletConnect logic are implemented in-repo and tested against published vectors.
 - **Encrypted export:** back up a wallet as a ZIP protected with MetaMask's vault scheme.

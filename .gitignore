@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # Windows download-marker files (invalid paths on Windows checkouts)
 *:Zone.Identifier
+
+# Podman
+.devcontainer

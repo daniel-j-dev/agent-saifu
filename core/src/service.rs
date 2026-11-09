@@ -22,6 +22,8 @@ use crate::eth::u256::U256;
 use crate::eth::wallet::{VaultContents, validate_export_key, validate_password};
 use crate::http::HttpClient;
 use crate::json::Value;
+use crate::solana::swap::SolanaSwapSettings;
+use crate::solana::wallet::SolanaVault;
 use crate::store::{Store, WalletRecord, validate_wallet_name, write_new_private_file};
 use crate::sui::cetus::CetusSettings;
 use crate::sui::wallet::SuiVault;
@@ -30,6 +32,11 @@ use crate::walletconnect::manager::WcManager;
 use crate::walletconnect::relay::UnavailableRelay;
 use crate::zip;
 
+mod solana;
+mod solana_swap;
+#[cfg(test)]
+mod solana_tests;
+mod solana_wc;
 mod sui;
 mod sui_swap;
 #[cfg(test)]
@@ -97,6 +104,7 @@ pub struct WalletService {
     iterations: u32,
     swap: SwapSettings,
     cetus: CetusSettings,
+    solana_swap: SolanaSwapSettings,
     /// Pause between receipt checks and how many checks to make when waiting on an approval.
     receipt_wait: (Duration, u32),
 }
@@ -211,12 +219,18 @@ impl WalletService {
             iterations: vault::DEFAULT_ITERATIONS,
             swap: SwapSettings::default(),
             cetus: CetusSettings::default(),
+            solana_swap: SolanaSwapSettings::default(),
             receipt_wait: (Duration::from_secs(3), 60),
         }
     }
 
     pub fn with_swap_settings(mut self, settings: SwapSettings) -> WalletService {
         self.swap = settings;
+        self
+    }
+
+    pub fn with_solana_swap_settings(mut self, settings: SolanaSwapSettings) -> WalletService {
+        self.solana_swap = settings;
         self
     }
 
@@ -305,6 +319,20 @@ impl WalletService {
         Ok((record, contents))
     }
 
+    /// Unlocks a Solana wallet for one action.
+    pub(crate) fn unlock_solana(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> Result<(WalletRecord, SolanaVault), String> {
+        let (record, now) = self.open_record(name, password)?;
+        if record.blockchain != Blockchain::Solana {
+            return Err(Self::wrong_chain(&record, Blockchain::Solana));
+        }
+        let contents = self.unseal_with(name, now, SolanaVault::unseal(&record.vault, password))?;
+        Ok((record, contents))
+    }
+
     /// Checks the password of a wallet on any blockchain (rename, delete).
     fn authenticate(&self, name: &str, password: &str) -> Result<WalletRecord, String> {
         let (record, now) = self.open_record(name, password)?;
@@ -315,6 +343,10 @@ impl WalletService {
             }
             Blockchain::Sui => {
                 self.unseal_with(name, now, SuiVault::unseal(&record.vault, password))
+                    .map(|_| ())?;
+            }
+            Blockchain::Solana => {
+                self.unseal_with(name, now, SolanaVault::unseal(&record.vault, password))
                     .map(|_| ())?;
             }
         }
@@ -359,7 +391,8 @@ impl WalletService {
         self.create_wallet_on(blockchain, name, password, None)
     }
 
-    /// `network` (mainnet, testnet, devnet) applies to Sui wallets only; the default is mainnet.
+    /// `network` (mainnet, testnet, devnet) applies to Sui and Solana wallets only; the default
+    /// is mainnet.
     pub fn create_wallet_on(
         &self,
         blockchain: &str,
@@ -370,7 +403,7 @@ impl WalletService {
         let chain = Blockchain::parse(blockchain)?;
         let name = validate_wallet_name(name)?;
         validate_password(password)?;
-        let sui_network = Self::wallet_network(chain, network)?;
+        Self::check_network_arg(chain, network)?;
         if self.store.exists(&name) {
             return Err(format!("a wallet named '{name}' already exists"));
         }
@@ -380,8 +413,12 @@ impl WalletService {
                 self.store_new_wallet(chain, name, password, &contents, "created")
             }
             Blockchain::Sui => {
-                let contents = SuiVault::create_new(sui_network)?;
+                let contents = SuiVault::create_new(Self::sui_network_arg(network)?)?;
                 self.sui_store_new(name, password, &contents, "created")
+            }
+            Blockchain::Solana => {
+                let contents = SolanaVault::create_new(Self::solana_network_arg(network)?)?;
+                self.solana_store_new(name, password, &contents, "created")
             }
         }
     }
@@ -409,7 +446,7 @@ impl WalletService {
         let chain = Blockchain::parse(blockchain)?;
         let name = validate_wallet_name(name)?;
         validate_password(password)?;
-        let sui_network = Self::wallet_network(chain, network)?;
+        Self::check_network_arg(chain, network)?;
         if seed_phrase.is_some() == private_key.is_some() {
             return Err("provide exactly one of seed_phrase or private_key".to_string());
         }
@@ -431,6 +468,7 @@ impl WalletService {
                 self.store_new_wallet(chain, name, password, &contents, "imported")
             }
             Blockchain::Sui => {
+                let sui_network = Self::sui_network_arg(network)?;
                 let contents = match (seed_phrase, private_key) {
                     (Some(s), None) => SuiVault::from_mnemonic(s, sui_network)?,
                     (None, Some(k)) => SuiVault::from_private_key(k, sui_network)?,
@@ -441,19 +479,29 @@ impl WalletService {
                 }
                 self.sui_store_new(name, password, &contents, "imported")
             }
+            Blockchain::Solana => {
+                let solana_network = Self::solana_network_arg(network)?;
+                let contents = match (seed_phrase, private_key) {
+                    (Some(s), None) => SolanaVault::from_mnemonic(s, solana_network)?,
+                    (None, Some(k)) => SolanaVault::from_private_key(k, solana_network)?,
+                    _ => unreachable!("exactly one secret was checked above"),
+                };
+                if self.store.exists(&name) {
+                    return Err(format!("a wallet named '{name}' already exists"));
+                }
+                self.solana_store_new(name, password, &contents, "imported")
+            }
         }
     }
 
-    /// The Sui network a new wallet is bound to; Ethereum wallets take no network.
-    fn wallet_network(
-        chain: Blockchain,
-        network: Option<&str>,
-    ) -> Result<crate::sui::network::SuiNetwork, String> {
+    /// Only Sui and Solana wallets take a `network`; a bad one is refused before anything else.
+    fn check_network_arg(chain: Blockchain, network: Option<&str>) -> Result<(), String> {
         match (chain, network) {
-            (Blockchain::Sui, n) => Self::sui_network_arg(n),
-            (Blockchain::Ethereum, None) => Ok(crate::sui::network::SuiNetwork::Mainnet),
+            (Blockchain::Sui, n) => Self::sui_network_arg(n).map(drop),
+            (Blockchain::Solana, n) => Self::solana_network_arg(n).map(drop),
+            (Blockchain::Ethereum, None) => Ok(()),
             (Blockchain::Ethereum, Some(_)) => Err(
-                "'network' applies to Sui wallets only; Ethereum networks are chosen per call with chain_id and managed with add_network".to_string(),
+                "'network' applies to Sui and Solana wallets only; Ethereum networks are chosen per call with chain_id and managed with add_network".to_string(),
             ),
         }
     }
@@ -528,8 +576,10 @@ impl WalletService {
     }
 
     pub fn get_address(&self, name: &str, password: &str) -> Result<Value, String> {
-        if self.chain_of(name, password)? == Blockchain::Sui {
-            return self.sui_address(name, password);
+        match self.chain_of(name, password)? {
+            Blockchain::Sui => return self.sui_address(name, password),
+            Blockchain::Solana => return self.solana_address(name, password),
+            Blockchain::Ethereum => {}
         }
         let (record, contents) = self.unlock(name, password)?;
         let address = contents.address()?;
@@ -543,8 +593,10 @@ impl WalletService {
     // ---- secrets ------------------------------------------------------------
 
     pub fn view_seed_phrase(&self, name: &str, password: &str) -> Result<Value, String> {
-        if self.chain_of(name, password)? == Blockchain::Sui {
-            return self.sui_seed_phrase(name, password);
+        match self.chain_of(name, password)? {
+            Blockchain::Sui => return self.sui_seed_phrase(name, password),
+            Blockchain::Solana => return self.solana_seed_phrase(name, password),
+            Blockchain::Ethereum => {}
         }
         let (record, contents) = self.unlock(name, password)?;
         let phrase = contents
@@ -561,8 +613,10 @@ impl WalletService {
     }
 
     pub fn view_private_key(&self, name: &str, password: &str) -> Result<Value, String> {
-        if self.chain_of(name, password)? == Blockchain::Sui {
-            return self.sui_private_key(name, password);
+        match self.chain_of(name, password)? {
+            Blockchain::Sui => return self.sui_private_key(name, password),
+            Blockchain::Solana => return self.solana_private_key(name, password),
+            Blockchain::Ethereum => {}
         }
         let (record, contents) = self.unlock(name, password)?;
         let key = contents.private_key()?;
@@ -635,6 +689,11 @@ impl WalletService {
                 let payload = Self::sui_export_payload(&record.name, &vault)?;
                 (record.name, payload, vault.mnemonic().is_some())
             }
+            Blockchain::Solana => {
+                let (record, vault) = self.unlock_solana(name, password)?;
+                let payload = Self::solana_export_payload(&record.name, &vault)?;
+                (record.name, payload, vault.mnemonic().is_some())
+            }
             Blockchain::Ethereum => {
                 let (record, contents) = self.unlock(name, password)?;
                 let payload = export_payload(&record.name, record.blockchain, &contents)?;
@@ -673,8 +732,10 @@ impl WalletService {
     // ---- networks -----------------------------------------------------------
 
     pub fn view_networks(&self, name: &str, password: &str) -> Result<Value, String> {
-        if self.chain_of(name, password)? == Blockchain::Sui {
-            return self.sui_networks(name, password);
+        match self.chain_of(name, password)? {
+            Blockchain::Sui => return self.sui_networks(name, password),
+            Blockchain::Solana => return self.solana_networks(name, password),
+            Blockchain::Ethereum => {}
         }
         let (record, contents) = self.unlock(name, password)?;
         let list = networks::all_networks(&contents.networks)

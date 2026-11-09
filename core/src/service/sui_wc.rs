@@ -60,6 +60,7 @@ impl WalletService {
             )])),
             chains: vec![],
             sui_chain: Some(approval.chain.clone()),
+            solana_chains: vec![],
             methods: approval.methods.clone(),
         };
         let approved =
@@ -91,7 +92,7 @@ impl WalletService {
         let (request, session) = self.wc_clone_request(request_id)?;
         let Action::Sui(sui) = &request.action else {
             return Err(
-                "this is an Ethereum request; use an Ethereum wallet and give its chain_id"
+                "this is not a Sui request; use a wallet on the blockchain the request is for (an Ethereum wallet also needs its chain_id)"
                     .to_string(),
             );
         };

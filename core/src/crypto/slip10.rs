@@ -1,4 +1,4 @@
-//! SLIP-0010 hierarchical key derivation for Ed25519 (used by Sui).
+//! SLIP-0010 hierarchical key derivation for Ed25519 (used by Sui and Solana).
 //!
 //! Ed25519 only supports hardened children, so every level of the path must be hardened.
 
@@ -11,6 +11,9 @@ const MASTER_KEY: &[u8] = b"ed25519 seed";
 
 /// Sui's default account path (first account): `m/44'/784'/0'/0'/0'`.
 pub const SUI_DEFAULT_PATH: &str = "m/44'/784'/0'/0'/0'";
+
+/// Solana's default account path (first account), the one Phantom uses: `m/44'/501'/0'/0'`.
+pub const SOLANA_DEFAULT_PATH: &str = "m/44'/501'/0'/0'";
 
 pub struct Ed25519Node {
     key: [u8; 32],
@@ -134,5 +137,13 @@ mod tests {
         assert_eq!(indices.len(), 5);
         assert!(indices.iter().all(|i| *i >= HARDENED));
         assert_eq!(indices[1], 784 | HARDENED);
+    }
+
+    #[test]
+    fn solana_default_path_is_all_hardened() {
+        let indices = parse_path(SOLANA_DEFAULT_PATH).unwrap();
+        assert_eq!(indices.len(), 4);
+        assert!(indices.iter().all(|i| *i >= HARDENED));
+        assert_eq!(indices[1], 501 | HARDENED);
     }
 }

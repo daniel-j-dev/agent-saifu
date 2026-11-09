@@ -9,7 +9,7 @@ use crate::crypto::hex;
 use crate::http::HttpClient;
 use crate::json::{self, Value};
 
-const BASE_URL: &str = "https://api.coingecko.com/api/v3";
+pub(crate) const BASE_URL: &str = "https://api.coingecko.com/api/v3";
 
 pub struct PriceClient<'a> {
     http: &'a dyn HttpClient,

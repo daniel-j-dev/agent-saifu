@@ -4,6 +4,7 @@ use crate::crypto::hex;
 use crate::eth::address::{Address, to_checksum};
 use crate::eth::explorer::sanitize_text_max;
 use crate::json::Value;
+use crate::solana::network::SolanaNetwork;
 
 /// Methods this wallet can answer. `eth_sign` is deliberately absent: it signs an arbitrary
 /// hash and cannot be reviewed, so a dapp that insists on it cannot be connected.
@@ -21,6 +22,16 @@ pub const SUI_SUPPORTED_METHODS: [&str; 4] = [
     "sui_signTransaction",
     "sui_signAndExecuteTransaction",
     "sui_signPersonalMessage",
+];
+
+/// Methods answered for Solana wallets (Reown's Solana RPC reference).
+pub const SOLANA_SUPPORTED_METHODS: [&str; 6] = [
+    "solana_getAccounts",
+    "solana_requestAccounts",
+    "solana_signMessage",
+    "solana_signTransaction",
+    "solana_signAndSendTransaction",
+    "solana_signAllTransactions",
 ];
 
 const MAX_CHAINS: usize = 50;
@@ -80,6 +91,9 @@ impl SuiRequirements {
     }
 }
 
+/// What one side of a proposal asks for on Solana, with chains like `solana:<reference>`.
+pub type SolanaRequirements = SuiRequirements;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposalData {
     pub proposer_public: [u8; 32],
@@ -88,7 +102,10 @@ pub struct ProposalData {
     pub optional: Requirements,
     pub sui_required: SuiRequirements,
     pub sui_optional: SuiRequirements,
-    /// Required namespaces other than `eip155` and `sui` (e.g. `solana`), which cannot be provided.
+    pub solana_required: SolanaRequirements,
+    pub solana_optional: SolanaRequirements,
+    /// Required namespaces other than `eip155`, `sui` and `solana` (e.g. `cosmos`), which cannot
+    /// be provided.
     pub unsupported_required: Vec<String>,
     pub expiry: Option<u64>,
 }
@@ -115,6 +132,17 @@ pub fn parse_sui_chain(text: &str) -> Result<String, String> {
         .strip_prefix("sui:")
         .ok_or_else(|| format!("'{}' is not a Sui chain", sanitize_text_max(text, 40)))?;
     if id.is_empty() || id.len() > 32 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!("invalid chain '{}'", sanitize_text_max(text, 40)));
+    }
+    Ok(text.to_string())
+}
+
+/// `solana:<reference>` -> itself, once the reference looks like a CAIP-2 reference.
+pub fn parse_solana_chain(text: &str) -> Result<String, String> {
+    let id = text
+        .strip_prefix("solana:")
+        .ok_or_else(|| format!("'{}' is not a Solana chain", sanitize_text_max(text, 40)))?;
+    if id.is_empty() || id.len() > 44 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err(format!("invalid chain '{}'", sanitize_text_max(text, 40)));
     }
     Ok(text.to_string())
@@ -215,6 +243,35 @@ fn parse_sui_namespaces(map: Option<&Value>) -> Result<SuiRequirements, String> 
     Ok(out)
 }
 
+/// Reads the `solana` entries of a namespace map; keys are `solana` or `solana:<reference>`.
+fn parse_solana_namespaces(map: Option<&Value>) -> Result<SolanaRequirements, String> {
+    let mut out = SolanaRequirements::default();
+    let Some(Value::Object(pairs)) = map else {
+        return Ok(out);
+    };
+    for (key, ns) in pairs {
+        if key.split(':').next() != Some("solana") {
+            continue;
+        }
+        if key.contains(':') {
+            push_unique(&mut out.chains, parse_solana_chain(key)?);
+        }
+        for chain in string_list(ns.get("chains"), "chains")? {
+            push_unique(&mut out.chains, parse_solana_chain(&chain)?);
+        }
+        for method in string_list(ns.get("methods"), "methods")? {
+            push_unique(&mut out.methods, method);
+        }
+        for event in string_list(ns.get("events"), "events")? {
+            push_unique(&mut out.events, event);
+        }
+    }
+    if out.chains.len() > MAX_CHAINS {
+        return Err("the proposal names too many chains".to_string());
+    }
+    Ok(out)
+}
+
 pub fn parse_proposal(params: &Value) -> Result<ProposalData, String> {
     let proposer = params.get("proposer").ok_or("proposal has no proposer")?;
     let key_hex = proposer
@@ -224,10 +281,12 @@ pub fn parse_proposal(params: &Value) -> Result<ProposalData, String> {
     let proposer_public = hex::decode_fixed::<32>(key_hex)
         .map_err(|_| "the proposer public key is invalid".to_string())?;
     let (required, mut unsupported_required) = parse_namespaces(params.get("requiredNamespaces"))?;
-    unsupported_required.retain(|n| n != "sui");
+    unsupported_required.retain(|n| n != "sui" && n != "solana");
     let (optional, _) = parse_namespaces(params.get("optionalNamespaces"))?;
     let sui_required = parse_sui_namespaces(params.get("requiredNamespaces"))?;
     let sui_optional = parse_sui_namespaces(params.get("optionalNamespaces"))?;
+    let solana_required = parse_solana_namespaces(params.get("requiredNamespaces"))?;
+    let solana_optional = parse_solana_namespaces(params.get("optionalNamespaces"))?;
     Ok(ProposalData {
         proposer_public,
         dapp: DappMetadata::from_json(proposer.get("metadata")),
@@ -235,6 +294,8 @@ pub fn parse_proposal(params: &Value) -> Result<ProposalData, String> {
         optional,
         sui_required,
         sui_optional,
+        solana_required,
+        solana_optional,
         unsupported_required,
         expiry: params.get("expiryTimestamp").and_then(Value::as_u64),
     })
@@ -267,6 +328,12 @@ pub fn plan_approval(proposal: &ProposalData, chosen: &[u64]) -> Result<Approval
     if !proposal.sui_required.is_empty() {
         return Err(
             "the dapp requires Sui, which an Ethereum wallet cannot provide; approve with a Sui wallet or reject the proposal"
+                .to_string(),
+        );
+    }
+    if !proposal.solana_required.is_empty() {
+        return Err(
+            "the dapp requires Solana, which an Ethereum wallet cannot provide; approve with a Solana wallet or reject the proposal"
                 .to_string(),
         );
     }
@@ -375,6 +442,12 @@ pub fn plan_sui_approval(proposal: &ProposalData, chain: &str) -> Result<SuiAppr
                 .to_string(),
         );
     }
+    if !proposal.solana_required.is_empty() {
+        return Err(
+            "the dapp requires Solana, which a Sui wallet cannot provide; approve with a Solana wallet or reject the proposal"
+                .to_string(),
+        );
+    }
     let (req, opt) = (&proposal.sui_required, &proposal.sui_optional);
     let others: Vec<String> = req
         .chains
@@ -466,6 +539,136 @@ pub fn sui_settle_namespaces(approval: &SuiApproval, address: &str) -> Value {
                 "accounts",
                 strings(vec![format!("{}:{address}", approval.chain)]),
             ),
+            ("methods", strings(approval.methods.clone())),
+            ("events", strings(approval.events.clone())),
+        ]),
+    )])
+}
+
+/// What the wallet grants a dapp on Solana: the wallet's own cluster, under the identifier(s)
+/// the dapp used for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SolanaApproval {
+    pub chains: Vec<String>,
+    pub methods: Vec<String>,
+    pub events: Vec<String>,
+}
+
+/// Checks a proposal against a Solana wallet bound to `network`.
+pub fn plan_solana_approval(
+    proposal: &ProposalData,
+    network: SolanaNetwork,
+) -> Result<SolanaApproval, String> {
+    if !proposal.unsupported_required.is_empty() {
+        return Err(format!(
+            "the dapp requires namespaces this wallet cannot provide ({}); reject the proposal",
+            proposal.unsupported_required.join(", ")
+        ));
+    }
+    if !proposal.required.chains.is_empty() || !proposal.required.methods.is_empty() {
+        return Err(
+            "the dapp requires Ethereum (eip155), which a Solana wallet cannot provide; approve with an Ethereum wallet or reject the proposal"
+                .to_string(),
+        );
+    }
+    if !proposal.sui_required.is_empty() {
+        return Err(
+            "the dapp requires Sui, which a Solana wallet cannot provide; approve with a Sui wallet or reject the proposal"
+                .to_string(),
+        );
+    }
+    let (req, opt) = (&proposal.solana_required, &proposal.solana_optional);
+    let others: Vec<String> = req
+        .chains
+        .iter()
+        .filter(|c| !network.matches_chain(c))
+        .map(|c| sanitize_text_max(c, 50))
+        .collect();
+    if !others.is_empty() {
+        return Err(format!(
+            "the dapp requires {} but this wallet is on Solana {}; a Solana wallet is bound to one cluster",
+            others.join(", "),
+            network.id()
+        ));
+    }
+    let mut chains: Vec<String> = vec![];
+    for chain in req.chains.iter().chain(&opt.chains) {
+        if network.matches_chain(chain) {
+            push_unique(&mut chains, chain.clone());
+        }
+    }
+    if chains.is_empty() {
+        let asked: Vec<String> = req
+            .chains
+            .iter()
+            .chain(&opt.chains)
+            .map(|c| sanitize_text_max(c, 50))
+            .collect();
+        return Err(format!(
+            "the dapp did not ask for {}; it asked for {}",
+            network.chain_name(),
+            if asked.is_empty() {
+                "no Solana chain".to_string()
+            } else {
+                asked.join(", ")
+            }
+        ));
+    }
+    let unsupported: Vec<String> = req
+        .methods
+        .iter()
+        .filter(|m| !SOLANA_SUPPORTED_METHODS.contains(&m.as_str()))
+        .map(|m| sanitize_text_max(m, 60))
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "the dapp requires methods this wallet does not support ({}); reject the proposal",
+            unsupported.join(", ")
+        ));
+    }
+    let mut methods: Vec<String> = vec![];
+    for method in req.methods.iter().chain(&opt.methods) {
+        if SOLANA_SUPPORTED_METHODS.contains(&method.as_str()) {
+            push_unique(&mut methods, method.clone());
+        }
+    }
+    if methods.is_empty() {
+        return Err("none of the methods the dapp asked for are supported".to_string());
+    }
+    let mut events: Vec<String> = vec![];
+    for event in req.events.iter().chain(&opt.events) {
+        if event
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            push_unique(&mut events, event.clone());
+        }
+    }
+    Ok(SolanaApproval {
+        chains,
+        methods,
+        events,
+    })
+}
+
+/// The `solana_getAccounts` answer: `[{pubkey}]`.
+pub fn solana_accounts_value(address: &str) -> Value {
+    Value::Array(vec![Value::object(vec![("pubkey", Value::str(address))])])
+}
+
+/// The `namespaces` object of `wc_sessionSettle` for a Solana wallet.
+pub fn solana_settle_namespaces(approval: &SolanaApproval, address: &str) -> Value {
+    let strings = |items: Vec<String>| Value::Array(items.into_iter().map(Value::String).collect());
+    let accounts: Vec<String> = approval
+        .chains
+        .iter()
+        .map(|c| format!("{c}:{address}"))
+        .collect();
+    Value::object(vec![(
+        "solana",
+        Value::object(vec![
+            ("chains", strings(approval.chains.clone())),
+            ("accounts", strings(accounts)),
             ("methods", strings(approval.methods.clone())),
             ("events", strings(approval.events.clone())),
         ]),
@@ -645,13 +848,175 @@ mod tests {
     fn other_namespaces_are_flagged_when_required_and_ignored_when_optional() {
         let p = proposal(&format!(
             r#"{{"proposer":{{"publicKey":"{PUB}"}},
-            "requiredNamespaces":{{"solana":{{"chains":["solana:5eykt"],"methods":["solana_signMessage"],"events":[]}}}},
-            "optionalNamespaces":{{"cosmos":{{"chains":[],"methods":[],"events":[]}}}}}}"#
+            "requiredNamespaces":{{"cosmos":{{"chains":["cosmos:cosmoshub-4"],"methods":["cosmos_signDirect"],"events":[]}}}},
+            "optionalNamespaces":{{"polkadot":{{"chains":[],"methods":[],"events":[]}}}}}}"#
         ))
         .unwrap();
-        assert_eq!(p.unsupported_required, vec!["solana"]);
+        assert_eq!(p.unsupported_required, vec!["cosmos"]);
         assert_eq!(p.optional, Requirements::default());
-        assert!(plan_approval(&p, &[1]).unwrap_err().contains("solana"));
+        assert!(plan_approval(&p, &[1]).unwrap_err().contains("cosmos"));
+    }
+
+    fn solana_proposal(required: &str, optional: &str) -> ProposalData {
+        sui_proposal(required, optional)
+    }
+
+    const SOL_MAINNET: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+    const SOL_DEVNET: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+
+    fn solana_required() -> String {
+        format!(
+            r#"{{"solana":{{"chains":["{SOL_MAINNET}"],"methods":["solana_signTransaction","solana_signMessage"],"events":[]}}}}"#
+        )
+    }
+
+    #[test]
+    fn parses_solana_namespaces_and_does_not_call_them_unsupported() {
+        let p = solana_proposal(
+            &solana_required(),
+            &format!(
+                r#"{{"{SOL_DEVNET}":{{"methods":["solana_signAndSendTransaction"],"events":["x"]}}}}"#
+            ),
+        );
+        assert!(p.unsupported_required.is_empty());
+        assert_eq!(p.solana_required.chains, vec![SOL_MAINNET]);
+        assert_eq!(p.solana_optional.chains, vec![SOL_DEVNET]);
+        assert_eq!(
+            p.solana_optional.methods,
+            vec!["solana_signAndSendTransaction"]
+        );
+        assert!(p.required.chains.is_empty() && p.sui_required.is_empty());
+        assert!(proposal(&format!(
+            r#"{{"proposer":{{"publicKey":"{PUB}"}},"requiredNamespaces":{{"solana:bad chain":{{}}}}}}"#
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn plans_a_solana_approval_on_the_wallets_cluster() {
+        let p = solana_proposal(
+            &solana_required(),
+            &format!(
+                r#"{{"solana":{{"chains":["{SOL_DEVNET}"],"methods":["solana_signAndSendTransaction","solana_nope"],"events":["a b","chainChanged"]}}}}"#
+            ),
+        );
+        let a = plan_solana_approval(&p, SolanaNetwork::Mainnet).unwrap();
+        assert_eq!(a.chains, vec![SOL_MAINNET]);
+        assert_eq!(
+            a.methods,
+            vec![
+                "solana_signTransaction",
+                "solana_signMessage",
+                "solana_signAndSendTransaction"
+            ]
+        );
+        assert_eq!(a.events, vec!["chainChanged"]);
+        let ns = solana_settle_namespaces(&a, "ADDR");
+        let solana = ns.get("solana").unwrap();
+        assert_eq!(
+            solana.get("accounts").unwrap().as_array().unwrap()[0].as_str(),
+            Some(format!("{SOL_MAINNET}:ADDR").as_str())
+        );
+        let devnet = plan_solana_approval(
+            &solana_proposal(
+                "{}",
+                &format!(
+                    r#"{{"solana":{{"chains":["{SOL_DEVNET}"],"methods":["solana_signMessage"]}}}}"#
+                ),
+            ),
+            SolanaNetwork::Devnet,
+        )
+        .unwrap();
+        assert_eq!(devnet.chains, vec![SOL_DEVNET]);
+    }
+
+    #[test]
+    fn legacy_chain_identifiers_are_granted_as_the_dapp_wrote_them() {
+        let legacy = "solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ";
+        let p = solana_proposal(
+            &format!(
+                r#"{{"solana":{{"chains":["{legacy}"],"methods":["solana_signTransaction"],"events":[]}}}}"#
+            ),
+            "{}",
+        );
+        let a = plan_solana_approval(&p, SolanaNetwork::Mainnet).unwrap();
+        assert_eq!(a.chains, vec![legacy]);
+        assert!(plan_solana_approval(&p, SolanaNetwork::Devnet).is_err());
+    }
+
+    #[test]
+    fn solana_refuses_mismatched_blockchains_clusters_and_methods() {
+        let p = solana_proposal(&solana_required(), "{}");
+        let err = plan_solana_approval(&p, SolanaNetwork::Devnet).unwrap_err();
+        assert!(err.contains("requires solana:5eykt"), "{err}");
+        assert!(
+            plan_approval(&p, &[1])
+                .unwrap_err()
+                .contains("requires Solana")
+        );
+        assert!(
+            plan_sui_approval(&p, "sui:mainnet")
+                .unwrap_err()
+                .contains("requires Solana")
+        );
+        let eth = sample();
+        assert!(
+            plan_solana_approval(&eth, SolanaNetwork::Mainnet)
+                .unwrap_err()
+                .contains("requires Ethereum")
+        );
+        let sui = sui_proposal(SUI_REQUIRED, "{}");
+        assert!(
+            plan_solana_approval(&sui, SolanaNetwork::Mainnet)
+                .unwrap_err()
+                .contains("requires Sui")
+        );
+        let bad_method = solana_proposal(
+            &format!(
+                r#"{{"solana":{{"chains":["{SOL_MAINNET}"],"methods":["solana_sign_everything"],"events":[]}}}}"#
+            ),
+            "{}",
+        );
+        assert!(
+            plan_solana_approval(&bad_method, SolanaNetwork::Mainnet)
+                .unwrap_err()
+                .contains("does not support")
+        );
+        let other_chain = solana_proposal(
+            "{}",
+            &format!(
+                r#"{{"solana":{{"chains":["{SOL_DEVNET}"],"methods":["solana_signMessage"]}}}}"#
+            ),
+        );
+        assert!(
+            plan_solana_approval(&other_chain, SolanaNetwork::Mainnet)
+                .unwrap_err()
+                .contains("did not ask for")
+        );
+        let no_methods = solana_proposal(
+            &format!(r#"{{"solana":{{"chains":["{SOL_MAINNET}"],"methods":[],"events":[]}}}}"#),
+            "{}",
+        );
+        assert!(
+            plan_solana_approval(&no_methods, SolanaNetwork::Mainnet)
+                .unwrap_err()
+                .contains("none of the methods")
+        );
+        let cosmos = proposal(&format!(
+            r#"{{"proposer":{{"publicKey":"{PUB}"}},"requiredNamespaces":{{"cosmos":{{"chains":[],"methods":[]}}}}}}"#
+        ))
+        .unwrap();
+        assert!(
+            plan_solana_approval(&cosmos, SolanaNetwork::Mainnet)
+                .unwrap_err()
+                .contains("cosmos")
+        );
+    }
+
+    #[test]
+    fn solana_accounts_are_bare_addresses() {
+        let v = solana_accounts_value("ADDR");
+        assert_eq!(v.to_json(), r#"[{"pubkey":"ADDR"}]"#);
     }
 
     #[test]

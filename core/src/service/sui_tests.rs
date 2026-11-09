@@ -246,7 +246,7 @@ fn wallets_can_be_bound_to_testnet_or_devnet_and_networks_are_validated() {
         .service
         .create_wallet_on("ethereum", "E", PW, Some("testnet"))
         .unwrap_err();
-    assert!(err.contains("Sui wallets only"));
+    assert!(err.contains("Sui and Solana wallets only"));
     assert!(
         !f.service
             .list_wallets()
@@ -2047,19 +2047,19 @@ fn ethereum_wallets_still_need_their_chain_id_and_reject_sui_arguments() {
         "sign_contract_transaction",
         &format!(r#"{{{base},"chain_id":1,"transaction_bytes":"AAAA"}}"#),
     );
-    assert!(err && out.to_json().contains("Sui wallets"));
+    assert!(err && out.to_json().contains("Sui and Solana wallets"));
     let (err, out) = call(
         &tb,
         "estimate_gas_fee",
         &format!(r#"{{{base},"chain_id":1,"transaction_bytes":"AAAA"}}"#),
     );
-    assert!(err && out.to_json().contains("Sui wallets"));
+    assert!(err && out.to_json().contains("Sui and Solana wallets"));
     let (err, out) = call(
         &tb,
         "create_wallet",
         r#"{"blockchain":"ethereum","wallet_name":"E2","password":"correct-horse-battery","network":"testnet"}"#,
     );
-    assert!(err && out.to_json().contains("Sui wallets only"));
+    assert!(err && out.to_json().contains("Sui and Solana wallets only"));
 }
 
 #[test]

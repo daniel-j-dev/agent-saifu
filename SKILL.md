@@ -1,11 +1,11 @@
 ---
 name: agent-saifu
-description: Use the agent-saifu MCP server, an all-in-one crypto wallet for AI agents (Ethereum, EVM layer 2s and Sui). Use it to create or import wallets, check balances, send assets, swap tokens, sign transactions and messages, and connect to dapps over WalletConnect. Read this before calling any wallet tool, and before connecting a dapp.
+description: Use the agent-saifu MCP server, an all-in-one crypto wallet for AI agents (Ethereum, EVM layer 2s, Sui and Solana). Use it to create or import wallets, check balances, send assets, swap tokens, sign transactions and messages, and connect to dapps over WalletConnect. Read this before calling any wallet tool, and before connecting a dapp.
 ---
 
 # agent-saifu: crypto wallet for agents
 
-agent-saifu is a Rust MCP server (stdio JSON-RPC) that holds wallets and signs for you. It supports **Ethereum** (plus any EVM layer 2 you add, chosen per call with `chain_id`) and **Sui** (a wallet is bound to one network, so there is no `chain_id`). Solana and Bitcoin are not supported yet.
+agent-saifu is a Rust MCP server (stdio JSON-RPC) that holds wallets and signs for you. It supports **Ethereum** (plus any EVM layer 2 you add, chosen per call with `chain_id`), **Sui** and **Solana** (a Sui or Solana wallet is bound to one network, so there is no `chain_id`). Bitcoin is not supported yet.
 
 Full detail (every tool, parameters, security design, worked examples) is in `spec.md`, shipped next to this file. Read it when this summary is not enough.
 
@@ -31,7 +31,7 @@ Wherever this file says "ask the user" or "when the user says to approve", an op
 
 ## Ground rules
 
-- **Real funds.** Wallets usually hold real mainnet money, and sends, swaps and approvals are irreversible. Never spend, swap, send, approve a dapp request or export keys unless your principal told you to (an operated agent: the user said so; an autonomous agent: your mandate covers it). Confirm the recipient, asset and amount first. Sui recipients must be written out in full (`0x` plus 64 hex characters). Autonomous agents should also keep to any amount limits in their mandate.
+- **Real funds.** Wallets usually hold real mainnet money, and sends, swaps and approvals are irreversible. Never spend, swap, send, approve a dapp request or export keys unless your principal told you to (an operated agent: the user said so; an autonomous agent: your mandate covers it). Confirm the recipient, asset and amount first. Sui recipients must be written out in full (`0x` plus 64 hex characters), and Solana recipients are base58 wallet addresses (never a program address). Autonomous agents should also keep to any amount limits in their mandate.
 - **Passwords, seed phrases and private keys.** Every tool that touches a wallet needs `wallet_name` and `password`. The wallet is unlocked for that one call and locked again on return; unlocking one wallet never unlocks another. A wrong password is rate limited. Anyone who gets a seed phrase or private key controls the funds permanently, and a password plus the vault file does the same.
   - **Operated agent:** never store, log or repeat the user's password, seed phrase or private key beyond what the user asked for. Show a seed phrase or key (`view_seed_phrase`, `view_private_key`, `export_wallet`) only when the user asks.
   - **Autonomous agent:** the secrets are yours to handle as your mandate needs; nobody is there to ask. You decide where the password lives and when to read the seed phrase, and you are responsible for keeping every wallet's backup, private key and seed phrase safe and findable (see "Backing up a wallet"). Strong recommendations:
@@ -40,19 +40,19 @@ Wherever this file says "ask the user" or "when the user says to approve", an op
     - Use one wallet per purpose, funded only with what the task needs, so a leak costs little. Give separate wallets different passwords.
     - Use long, random, unique passwords (not examples like `demo-password-123`), and keep a backup of the seed phrase offline so losing the password or vault is recoverable.
     - Never paste a secret into a dapp, a web form or a message to anyone. Only the `wc_*` tools talk to dapps, and they never reveal secrets.
-- **Pick tools by wallet type.** Most tools work for both blockchains. Ethereum-only tools: `read_smart_contract`, `add_network`, `update_network`, `delete_network`, `add_token`, `remove_token`, `revoke_token_approval`. Giving `chain_id` to a Sui wallet, or a Sui wallet to an Ethereum-only tool, is refused.
+- **Pick tools by wallet type.** Most tools work for all three blockchains. Ethereum-only tools: `read_smart_contract`, `add_network`, `update_network`, `delete_network`, `add_token`, `remove_token`, `revoke_token_approval`. Giving `chain_id` to a Sui or Solana wallet, or a Sui or Solana wallet to an Ethereum-only tool, is refused.
 - **Look before you act.** Use `simulate_transaction` and `estimate_gas_fee` for sends, and `get_swap_quote` before `swap_tokens`. Always check balances with `get_wallet_balances` after a transaction and report the result honestly, including failures.
-- **Report what you did:** the transaction hash or digest, amounts, and anything left over (for example SUI or ETH held back for gas). An operated agent tells the user; an autonomous agent writes it to its log or output.
+- **Report what you did:** the transaction hash, digest or signature, amounts, and anything left over (for example SUI, SOL or ETH held back for gas). An operated agent tells the user; an autonomous agent writes it to its log or output.
 
 ## Common tasks
 
 | Task | Tools |
 |---|---|
 | See wallets | `list_wallets` (no password) |
-| Create or import | `create_wallet` (`blockchain` = `ethereum` or `sui`, optional Sui `network`), `import_wallet` |
+| Create or import | `create_wallet` (`blockchain` = `ethereum`, `sui` or `solana`, optional Sui or Solana `network`), `import_wallet` |
 | Address and balances | `get_wallet_address`, `get_wallet_balances` |
-| Send | `send_asset` (`asset` = `native`, an ERC-20 address, or a Sui coin type like `0x2::sui::SUI`) |
-| Swap | `get_swap_quote`, then `swap_tokens` (OpenOcean on Ethereum, Cetus on Sui mainnet) |
+| Send | `send_asset` (`asset` = `native`, an ERC-20 address, a Sui coin type like `0x2::sui::SUI`, or a Solana token mint address) |
+| Swap | `get_swap_quote`, then `swap_tokens` (OpenOcean on Ethereum, Jupiter on Solana mainnet, Cetus on Sui mainnet) |
 | Sign | `sign_contract_transaction`, `sign_personal_message` |
 | History and status | `get_transaction`, `get_transaction_history` |
 | Backup | `view_seed_phrase`, `view_private_key`, `export_wallet` (an encrypted ZIP in `~/.agent-saifu/exports/`; use a strong generated `encryption_key`, see "Backing up a wallet"; to open it later you need the ZIP and that key, and nothing else) |
@@ -60,9 +60,10 @@ Wherever this file says "ask the user" or "when the user says to approve", an op
 
 Notes that save time:
 
-- Sui swap tokens must be `native` or a full coin type, not a symbol.
+- Sui swap tokens must be `native` or a full coin type, not a symbol. Solana swap tokens must be `native` or a mint address.
 - Swaps are same-chain only. `min_receive` is a safety floor; on Sui pairs other than SUI/USDC it is required.
-- Sending a wallet's entire SUI or ETH balance needs a gas reserve, so a few dust units will remain. On Sui, one send can spend at most about the larger of the coin-object balance and the address balance, so a very large send may need to be split into two.
+- Solana: a token send opens the recipient's token account if they have none (a refundable deposit of about 0.00204 SOL paid by the sender). Unrecognised tokens in `get_wallet_balances` are often spam airdrops; never interact with a token you do not know. `sign_personal_message` refuses bytes that are a valid Solana transaction. The OpenOcean swap host can answer that Solana is unsupported (`get_swap_quote` then explains it and nothing is sent).
+- Sending a wallet's entire SUI, SOL or ETH balance needs a gas reserve, so a few dust units will remain. On Sui, one send can spend at most about the larger of the coin-object balance and the address balance, so a very large send may need to be split into two.
 - Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
 
 ## Backing up a wallet (`export_wallet`)
@@ -93,14 +94,14 @@ An operated agent does not take this over: it helps the user back up when asked,
 
 ## Connecting to dapps with WalletConnect
 
-Any dapp that shows a WalletConnect QR code or `wc:` link (Uniswap, Cetus, Aave and so on) can connect to an Ethereum or Sui wallet.
+Any dapp that shows a WalletConnect QR code or `wc:` link (Uniswap, Cetus, Jupiter, Aave and so on) can connect to an Ethereum, Sui or Solana wallet.
 
 **The MCP server must keep running for the whole time you use a dapp.** WalletConnect sessions and the requests dapps send live only in the memory of the running `agent-saifu-core` process. If the server exits or restarts, the session is gone, the dapp must be paired again, and you will never see its transaction requests. Start the server once, keep the same process and connection open, and send every later tool call to it. Do not launch a fresh process per call for WalletConnect work.
 
 The flow:
 
-1. Get a `wc:` URI. Operated: the user gives it to you. Autonomous: you get it yourself from the dapp's connect dialog (the WalletConnect QR code or "copy link"), then call `wc_pair` with it and read the proposal (`can_connect_with` says whether an Ethereum wallet, a Sui wallet or both can satisfy it).
-2. `wc_approve_session` with `proposal_id`, `wallet_name`, `password` (plus `chain_id` for Ethereum wallets; omit it for Sui), or `wc_reject_session`. Autonomous: only connect to the dapp your task calls for.
+1. Get a `wc:` URI. Operated: the user gives it to you. Autonomous: you get it yourself from the dapp's connect dialog (the WalletConnect QR code or "copy link"), then call `wc_pair` with it and read the proposal (`can_connect_with` says whether an Ethereum wallet, a Sui wallet, a Solana wallet or several can satisfy it).
+2. `wc_approve_session` with `proposal_id`, `wallet_name`, `password` (plus `chain_id` for Ethereum wallets; omit it for Sui and Solana), or `wc_reject_session`. Autonomous: only connect to the dapp your task calls for.
 3. Trigger the action in the dapp. Operated: ask the user to do it (or do it yourself if you can drive the dapp). Autonomous: do it yourself; never wait for a person. Then poll `wc_list_requests` until the request appears (every few seconds).
 4. `wc_review_request` (wallet, password, `chain_id` for Ethereum) shows a dry run, the plain-language outcome, balance changes, fees and warnings. Read it. Operated: tell the user what it will do.
 5. Approve with `wc_approve_request`, or decline with `wc_reject_request`.
@@ -111,10 +112,10 @@ Things to know:
 
 - **A `wc:` link is single use and short lived.** It expires within minutes and cannot be reused after a restart. If you restart the server, get a new link (operated: ask the user; autonomous: generate a new one from the dapp) and pair again straight away.
 - **Requests expire after about five minutes.** Review and approve promptly. Operated: once the user has asked you to. Autonomous: right after the review passes.
-- **Signing is not always broadcasting.** On Sui, dapps such as Cetus use `sui_signTransaction`: the wallet only returns the signature and the dapp submits the transaction. Check that the approval says `dapp_notified: true`, then confirm with `get_wallet_balances` or `get_transaction`. On Ethereum, `eth_sendTransaction` is broadcast by the wallet.
+- **Signing is not always broadcasting.** On Sui, dapps such as Cetus use `sui_signTransaction`: the wallet only returns the signature and the dapp submits the transaction. On Solana, `solana_signTransaction` and `solana_signAllTransactions` only sign (the dapp submits), while `solana_signAndSendTransaction` signs and submits. Check that the approval says `dapp_notified: true`, then confirm with `get_wallet_balances` or `get_transaction`. On Ethereum, `eth_sendTransaction` is broadcast by the wallet.
 - **Refused requests never show up in `wc_list_requests`.** Unsupported chains, methods or formats are answered to the dapp with an error, and the server writes `walletconnect: refused a dapp request (...)` with the reason to stderr. If the list stays empty, check stderr.
 - **A stale connection means restarting.** A long-running server can lose its relay connection (`NotParticipant`, or `dapp_notified: false` on approval). Restart the server, get a new link (see above), and pair again.
-- **Not supported:** `eth_sign`, contract creation, WalletConnect Auth sign-in, Sui sponsored transactions, and dapps that need a namespace other than `eip155` or `sui` (or both at once).
+- **Not supported:** `eth_sign`, contract creation, WalletConnect Auth sign-in, Sui sponsored transactions, and dapps that need a namespace other than `eip155`, `sui` or `solana` (or more than one of those at once).
 - WalletConnect needs a project ID. One is built in; the `WALLETCONNECT_PROJECT_ID` environment variable overrides it.
 
 ## If something goes wrong

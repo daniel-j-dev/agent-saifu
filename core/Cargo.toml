@@ -3,6 +3,7 @@ name = "agent-saifu-core"
 version = "0.0.0"
 description = "All-in-one crypto wallet for Agents. Built from the ground up in Rust."
 edition = "2024"
+rust-version = "1.99.1"
 
 [dependencies]
 aes-gcm = "0.11.1"

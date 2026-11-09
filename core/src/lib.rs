@@ -13,6 +13,8 @@ pub mod metadata;
 pub mod protocol;
 pub mod server;
 pub mod service;
+pub mod solana;
+pub mod solana_config;
 pub mod store;
 pub mod sui;
 pub mod sui_swap_config;

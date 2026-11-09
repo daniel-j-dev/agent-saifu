@@ -65,6 +65,9 @@ pub struct Session {
     pub chains: Vec<u64>,
     /// The Sui chain (`sui:mainnet`) of a Sui session; such a session has no EVM chains.
     pub sui_chain: Option<String>,
+    /// The Solana chains (`solana:<reference>`) of a Solana session, written as the dapp wrote
+    /// them; such a session has no EVM chains.
+    pub solana_chains: Vec<String>,
     pub methods: Vec<String>,
     pub dapp: DappMetadata,
     pub created_at: u64,
@@ -78,9 +81,10 @@ pub struct PendingRequest {
     pub id: u64,
     pub session_topic: String,
     pub method: String,
-    /// The EVM chain ID, or 0 for a Sui request.
+    /// The EVM chain ID, or 0 for a Sui or Solana request.
     pub chain_id: u64,
     pub sui_chain: Option<String>,
+    pub solana_chain: Option<String>,
     pub action: Action,
     pub received_at: u64,
     pub expires_at: u64,
@@ -93,6 +97,7 @@ pub struct SessionTerms {
     pub properties: Option<Value>,
     pub chains: Vec<u64>,
     pub sui_chain: Option<String>,
+    pub solana_chains: Vec<String>,
     pub methods: Vec<String>,
 }
 
@@ -345,9 +350,10 @@ impl WcManager {
         let Some(session) = self.sessions.iter().find(|s| s.topic == topic) else {
             return;
         };
-        let (session_chains, session_sui, session_methods) = (
+        let (session_chains, session_sui, session_solana, session_methods) = (
             session.chains.clone(),
             session.sui_chain.clone(),
+            session.solana_chains.clone(),
             session.methods.clone(),
         );
         let now = now_secs();
@@ -399,11 +405,16 @@ impl WcManager {
         ) else {
             return respond_error(self, proto::INVALID_REQUEST, "Malformed request");
         };
-        let (chain_id, sui_chain) = if let Some(sui) = &session_sui {
+        let (chain_id, sui_chain, solana_chain) = if let Some(sui) = &session_sui {
             if chain_text != sui {
                 return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
             }
-            (0, Some(sui.clone()))
+            (0, Some(sui.clone()), None)
+        } else if !session_solana.is_empty() {
+            if !session_solana.iter().any(|c| c == chain_text) {
+                return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
+            }
+            (0, None, Some(chain_text.to_string()))
         } else {
             let Ok(chain_id) = namespaces::parse_chain_reference(chain_text) else {
                 return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
@@ -411,7 +422,7 @@ impl WcManager {
             if !session_chains.contains(&chain_id) {
                 return respond_error(self, proto::UNAUTHORIZED_CHAIN, "Unauthorized chain");
             }
-            (chain_id, None)
+            (chain_id, None, None)
         };
         if !session_methods.iter().any(|m| m == request_method) {
             return respond_error(self, proto::UNAUTHORIZED_METHOD, "Unauthorized method");
@@ -435,6 +446,7 @@ impl WcManager {
                 method: request_method.to_string(),
                 chain_id,
                 sui_chain,
+                solana_chain,
                 action,
                 received_at: now,
                 expires_at,
@@ -540,6 +552,7 @@ impl WcManager {
                 properties: None,
                 chains: approval.chains.clone(),
                 sui_chain: None,
+                solana_chains: vec![],
                 methods: approval.methods.clone(),
             },
         )
@@ -645,6 +658,7 @@ impl WcManager {
             wallet: wallet.to_string(),
             chains: terms.chains.clone(),
             sui_chain: terms.sui_chain.clone(),
+            solana_chains: terms.solana_chains.clone(),
             methods: terms.methods.clone(),
             dapp,
             created_at: now,
