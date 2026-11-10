@@ -9,6 +9,7 @@
 pub mod aead;
 pub mod base58;
 pub mod base64;
+pub mod bech32;
 pub mod bip32;
 pub mod bip39;
 pub mod chacha;
@@ -19,6 +20,7 @@ pub mod hmac;
 pub mod keccak;
 pub mod pbkdf2;
 pub mod random;
+pub mod ripemd160;
 pub mod secp256k1;
 pub mod secret;
 pub mod sha2;

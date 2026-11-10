@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::bitcoin::journal::BitcoinJournal;
+use crate::bitcoin::wallet::BitcoinVault;
 use crate::blockchain::Blockchain;
 use crate::crypto::{hex, sha2::sha256};
 use crate::eth::abi;
@@ -32,6 +34,9 @@ use crate::walletconnect::manager::WcManager;
 use crate::walletconnect::relay::UnavailableRelay;
 use crate::zip;
 
+mod bitcoin;
+#[cfg(test)]
+mod bitcoin_tests;
 mod solana;
 mod solana_swap;
 #[cfg(test)]
@@ -95,9 +100,18 @@ pub struct IntentParams {
     pub transaction_bytes: Option<String>,
 }
 
+/// How a Bitcoin payment's fee is chosen: an explicit rate in satoshis per virtual byte, or a
+/// confirmation target in blocks (default 6) answered from the network's fee estimates.
+#[derive(Debug, Default, Clone)]
+pub struct BitcoinFee {
+    pub fee_rate: Option<String>,
+    pub confirmation_target: Option<u64>,
+}
+
 pub struct WalletService {
     store: Store,
     pub(crate) journal: Journal,
+    btc_journal: BitcoinJournal,
     pub(crate) http: Rc<dyn HttpClient>,
     pub(crate) wc: RefCell<WcManager>,
     limiter: RefCell<AttemptLimiter>,
@@ -210,6 +224,7 @@ impl WalletService {
     pub fn new(store: Store, http: Rc<dyn HttpClient>) -> WalletService {
         WalletService {
             journal: Journal::new(store.pending_dir()),
+            btc_journal: BitcoinJournal::new(store.pending_dir()),
             store,
             http,
             wc: RefCell::new(WcManager::new(Rc::new(UnavailableRelay(
@@ -333,6 +348,21 @@ impl WalletService {
         Ok((record, contents))
     }
 
+    /// Unlocks a Bitcoin wallet for one action.
+    pub(crate) fn unlock_bitcoin(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> Result<(WalletRecord, BitcoinVault), String> {
+        let (record, now) = self.open_record(name, password)?;
+        if record.blockchain != Blockchain::Bitcoin {
+            return Err(Self::wrong_chain(&record, Blockchain::Bitcoin));
+        }
+        let contents =
+            self.unseal_with(name, now, BitcoinVault::unseal(&record.vault, password))?;
+        Ok((record, contents))
+    }
+
     /// Checks the password of a wallet on any blockchain (rename, delete).
     fn authenticate(&self, name: &str, password: &str) -> Result<WalletRecord, String> {
         let (record, now) = self.open_record(name, password)?;
@@ -347,6 +377,10 @@ impl WalletService {
             }
             Blockchain::Solana => {
                 self.unseal_with(name, now, SolanaVault::unseal(&record.vault, password))
+                    .map(|_| ())?;
+            }
+            Blockchain::Bitcoin => {
+                self.unseal_with(name, now, BitcoinVault::unseal(&record.vault, password))
                     .map(|_| ())?;
             }
         }
@@ -391,7 +425,7 @@ impl WalletService {
         self.create_wallet_on(blockchain, name, password, None)
     }
 
-    /// `network` (mainnet, testnet, devnet) applies to Sui and Solana wallets only; the default
+    /// `network` (mainnet, testnet, devnet) applies to Sui, Solana and Bitcoin wallets only; the default
     /// is mainnet.
     pub fn create_wallet_on(
         &self,
@@ -419,6 +453,10 @@ impl WalletService {
             Blockchain::Solana => {
                 let contents = SolanaVault::create_new(Self::solana_network_arg(network)?)?;
                 self.solana_store_new(name, password, &contents, "created")
+            }
+            Blockchain::Bitcoin => {
+                let contents = BitcoinVault::create_new(Self::bitcoin_network_arg(network)?)?;
+                self.bitcoin_store_new(name, password, &contents, "created")
             }
         }
     }
@@ -491,17 +529,31 @@ impl WalletService {
                 }
                 self.solana_store_new(name, password, &contents, "imported")
             }
+            Blockchain::Bitcoin => {
+                let bitcoin_network = Self::bitcoin_network_arg(network)?;
+                let contents = match (seed_phrase, private_key) {
+                    (Some(s), None) => BitcoinVault::from_mnemonic(s, bitcoin_network)?,
+                    (None, Some(k)) => BitcoinVault::from_private_key(k, bitcoin_network)?,
+                    _ => unreachable!("exactly one secret was checked above"),
+                };
+                if self.store.exists(&name) {
+                    return Err(format!("a wallet named '{name}' already exists"));
+                }
+                self.bitcoin_store_new(name, password, &contents, "imported")
+            }
         }
     }
 
-    /// Only Sui and Solana wallets take a `network`; a bad one is refused before anything else.
+    /// Only Sui, Solana and Bitcoin wallets take a `network`; a bad one is refused before
+    /// anything else.
     fn check_network_arg(chain: Blockchain, network: Option<&str>) -> Result<(), String> {
         match (chain, network) {
             (Blockchain::Sui, n) => Self::sui_network_arg(n).map(drop),
             (Blockchain::Solana, n) => Self::solana_network_arg(n).map(drop),
+            (Blockchain::Bitcoin, n) => Self::bitcoin_network_arg(n).map(drop),
             (Blockchain::Ethereum, None) => Ok(()),
             (Blockchain::Ethereum, Some(_)) => Err(
-                "'network' applies to Sui and Solana wallets only; Ethereum networks are chosen per call with chain_id and managed with add_network".to_string(),
+                "'network' applies to Sui, Solana and Bitcoin wallets only; Ethereum networks are chosen per call with chain_id and managed with add_network".to_string(),
             ),
         }
     }
@@ -579,6 +631,7 @@ impl WalletService {
         match self.chain_of(name, password)? {
             Blockchain::Sui => return self.sui_address(name, password),
             Blockchain::Solana => return self.solana_address(name, password),
+            Blockchain::Bitcoin => return self.bitcoin_address(name, password),
             Blockchain::Ethereum => {}
         }
         let (record, contents) = self.unlock(name, password)?;
@@ -596,6 +649,7 @@ impl WalletService {
         match self.chain_of(name, password)? {
             Blockchain::Sui => return self.sui_seed_phrase(name, password),
             Blockchain::Solana => return self.solana_seed_phrase(name, password),
+            Blockchain::Bitcoin => return self.bitcoin_seed_phrase(name, password),
             Blockchain::Ethereum => {}
         }
         let (record, contents) = self.unlock(name, password)?;
@@ -616,6 +670,7 @@ impl WalletService {
         match self.chain_of(name, password)? {
             Blockchain::Sui => return self.sui_private_key(name, password),
             Blockchain::Solana => return self.solana_private_key(name, password),
+            Blockchain::Bitcoin => return self.bitcoin_private_key(name, password),
             Blockchain::Ethereum => {}
         }
         let (record, contents) = self.unlock(name, password)?;
@@ -694,6 +749,11 @@ impl WalletService {
                 let payload = Self::solana_export_payload(&record.name, &vault)?;
                 (record.name, payload, vault.mnemonic().is_some())
             }
+            Blockchain::Bitcoin => {
+                let (record, vault) = self.unlock_bitcoin(name, password)?;
+                let payload = Self::bitcoin_export_payload(&record.name, &vault)?;
+                (record.name, payload, vault.mnemonic().is_some())
+            }
             Blockchain::Ethereum => {
                 let (record, contents) = self.unlock(name, password)?;
                 let payload = export_payload(&record.name, record.blockchain, &contents)?;
@@ -735,6 +795,7 @@ impl WalletService {
         match self.chain_of(name, password)? {
             Blockchain::Sui => return self.sui_networks(name, password),
             Blockchain::Solana => return self.solana_networks(name, password),
+            Blockchain::Bitcoin => return self.bitcoin_networks(name, password),
             Blockchain::Ethereum => {}
         }
         let (record, contents) = self.unlock(name, password)?;
@@ -1641,7 +1702,7 @@ mod tests {
         let f = fixture();
         assert!(
             f.service
-                .create_wallet("bitcoin", "w", PW)
+                .create_wallet("dogecoin", "w", PW)
                 .unwrap_err()
                 .contains("unsupported")
         );

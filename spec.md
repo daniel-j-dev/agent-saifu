@@ -21,52 +21,52 @@ All-in-one crypto wallet for Agents. Built from the ground up in Rust.
 
 ## Current features
 
-The MCP server lives in `core/` (Rust, stdio JSON-RPC, run with `cargo run -q` from `core/`; an MCP client launches the binary). Wallet logic for Ethereum is in `core/src/eth/`, for Sui in `core/src/sui/`, for Solana in `core/src/solana/`. Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
+The MCP server lives in `core/` (Rust, stdio JSON-RPC, run with `cargo run -q` from `core/`; an MCP client launches the binary). Wallet logic for Ethereum is in `core/src/eth/`, for Sui in `core/src/sui/`, for Solana in `core/src/solana/`, for Bitcoin in `core/src/bitcoin/`. Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
 
 ### MCP tools
 
 Every tool that touches a wallet needs the wallet's password; the wallet is unlocked only for that single call and is locked again when it returns. Unlocking one wallet never unlocks another. Wallet names are unique (case-insensitive).
 
-Three blockchains are supported: **Ethereum** (and EVM chains, selected per call with `chain_id`), **Sui** and **Solana** (a Sui or Solana wallet is bound to one network, so there is no `chain_id`). The tool is chosen by the wallet it is given: a tool shared by several reads the wallet's blockchain and does the right thing. The next table says which tools work with which wallet; the descriptions below say how each behaves (Ethereum unless a "Sui:" or "Solana:" note says otherwise).
+Four blockchains are supported: **Ethereum** (and EVM chains, selected per call with `chain_id`), **Sui**, **Solana** and **Bitcoin** (a Sui, Solana or Bitcoin wallet is bound to one network, so there is no `chain_id`). The tool is chosen by the wallet it is given: a tool shared by several reads the wallet's blockchain and does the right thing. The next table says which tools work with which wallet; the descriptions below say how each behaves (Ethereum unless a "Sui:", "Solana:" or "Bitcoin:" note says otherwise).
 
-| Tool | Ethereum | Sui | Solana | Notes |
-|---|---|---|---|---|
-| `get_info` | yes | yes | yes | |
-| `create_wallet` | yes | yes | yes | Sui and Solana take an optional `network` (`mainnet` default, `testnet`, `devnet`) |
-| `import_wallet` | yes | yes | yes | Sui: 24-word seed phrase, `suiprivkey1...` key or 64-hex Ed25519 key. Solana: 24-word seed phrase, the base58 key Phantom shows, a Solana CLI keypair byte list or hex |
-| `list_wallets`, `rename_wallet`, `delete_wallet` | yes | yes | yes | |
-| `get_wallet_address` | yes | yes | yes | |
-| `get_wallet_balances` | yes | yes | yes | Sui lists every coin type held, Solana SOL and every SPL / Token-2022 token; no `chain_id` / `token_contracts` |
-| `send_asset` | yes | yes | yes | Sui: SUI or any coin type; Solana: SOL or any token mint; no `chain_id` / `gas_limit` |
-| `sign_contract_transaction` | yes | yes | yes | Sui and Solana: sign a complete transaction (`transaction_bytes`); `broadcast=true` is sign-and-send |
-| `sign_personal_message` | yes (EIP-191) | yes | yes (raw Ed25519) | added for the Wallet Standard `signPersonalMessage` / Solana `signMessage` |
-| `estimate_gas_fee`, `simulate_transaction` | yes | yes | yes | Sui and Solana: a transfer, or given `transaction_bytes`; no `value` / `data` |
-| `get_transaction` | yes | yes | yes | Sui: `transaction_hash` is the base58 digest; Solana: the base58 signature |
-| `get_transaction_history` | yes | yes | yes | Sui and Solana: transactions only (no `token_transfers`) |
-| `list_networks` | yes | yes | yes | Sui and Solana: the one network the wallet is bound to |
-| `get_swap_quote`, `swap_tokens` | yes (OpenOcean) | yes (Cetus, mainnet) | yes (Jupiter, mainnet) | Sui and Solana: no `from_chain_id` / `to_chain_id`; Solana: no `to_address` |
-| `view_seed_phrase`, `view_private_key`, `export_wallet` | yes | yes | yes | Sui keys are shown as `suiprivkey1...` (plus hex), Solana keys as the base58 keypair Phantom imports (plus hex) |
-| `read_smart_contract` | yes | **no** | **no** | Sui and Solana have no equivalent call-by-signature; Move calls and Solana instructions go through `sign_contract_transaction` |
-| `add_network`, `update_network`, `delete_network` | yes | **no** | **no** | a Sui or Solana wallet is bound to its one network (Solana has no layer 2s to add) |
-| `add_token`, `remove_token` | yes | **no** | **no** | a Sui or Solana wallet lists every coin or token it holds automatically |
-| `revoke_token_approval` | yes | **no** | **no** | Sui has no token allowances; Solana delegates are shown by `simulate_transaction` / `wc_review_request` |
-| `wc_*` (WalletConnect) | yes | yes | yes | Sui uses the `sui` WalletConnect namespace and Solana the `solana` namespace (see "WalletConnect (any dapp)"); the Sui signing tools also mirror the Wallet Standard (see "Sui wallets"), and Solana follows Phantom (see "Solana wallets") |
+| Tool | Ethereum | Sui | Solana | Bitcoin | Notes |
+|---|---|---|---|---|---|
+| `get_info` | yes | yes | yes | yes | |
+| `create_wallet` | yes | yes | yes | yes | Sui and Solana take an optional `network` (`mainnet` default, `testnet`, `devnet`). Bitcoin takes an optional `network` too (`mainnet` default, `testnet` = testnet4, `signet`). |
+| `import_wallet` | yes | yes | yes | yes | Sui: 24-word seed phrase, `suiprivkey1...` key or 64-hex Ed25519 key. Solana: 24-word seed phrase, the base58 key Phantom shows, a Solana CLI keypair byte list or hex. Bitcoin: 24-word seed phrase, a compressed WIF key or 64-hex key. |
+| `list_wallets`, `rename_wallet`, `delete_wallet` | yes | yes | yes | yes | |
+| `get_wallet_address` | yes | yes | yes | yes | |
+| `get_wallet_balances` | yes | yes | yes | yes | Sui lists every coin type held, Solana SOL and every SPL / Token-2022 token; no `chain_id` / `token_contracts`. Bitcoin: BTC with confirmed and unconfirmed amounts; no `chain_id` / `token_contracts`. |
+| `send_asset` | yes | yes | yes | yes | Sui: SUI or any coin type; Solana: SOL or any token mint; no `chain_id` / `gas_limit`. Bitcoin: BTC only (`asset` = `native`), optional `fee_rate` / `confirmation_target`; no `chain_id` / `gas_limit`. |
+| `sign_contract_transaction` | yes | yes | yes | **no** | Sui and Solana: sign a complete transaction (`transaction_bytes`); `broadcast=true` is sign-and-send. Bitcoin wallets do not sign PSBTs or other externally built transactions; use `send_asset`. |
+| `sign_personal_message` | yes (EIP-191) | yes | yes (raw Ed25519) | yes (BIP 322) | added for the Wallet Standard `signPersonalMessage` / Solana `signMessage` |
+| `estimate_gas_fee`, `simulate_transaction` | yes | yes | yes | yes | Sui and Solana: a transfer, or given `transaction_bytes`; no `value` / `data`. Bitcoin: a payment (`to` + `amount`, plus optional `fee_rate` / `confirmation_target`); `estimate_gas_fee` without a payment lists the current rates; no `value` / `data` / `transaction_bytes`. |
+| `get_transaction` | yes | yes | yes | yes | Sui: `transaction_hash` is the base58 digest; Solana: the base58 signature. Bitcoin: `transaction_hash` is the 64-hex-digit transaction id. |
+| `get_transaction_history` | yes | yes | yes | yes | Sui and Solana: transactions only (no `token_transfers`). Bitcoin: transactions only. |
+| `list_networks` | yes | yes | yes | yes | Sui and Solana: the one network the wallet is bound to. Bitcoin: the one network the wallet is bound to. |
+| `get_swap_quote`, `swap_tokens` | yes (OpenOcean) | yes (Cetus, mainnet) | yes (Jupiter, mainnet) | **no** | Sui and Solana: no `from_chain_id` / `to_chain_id`; Solana: no `to_address`. No aggregator serves native Bitcoin. |
+| `view_seed_phrase`, `view_private_key`, `export_wallet` | yes | yes | yes | yes | Sui keys are shown as `suiprivkey1...` (plus hex), Solana keys as the base58 keypair Phantom imports (plus hex). Bitcoin keys are shown as compressed WIF (plus hex). |
+| `read_smart_contract` | yes | **no** | **no** | **no** | Sui and Solana have no equivalent call-by-signature; Move calls and Solana instructions go through `sign_contract_transaction` |
+| `add_network`, `update_network`, `delete_network` | yes | **no** | **no** | **no** | a Sui or Solana wallet is bound to its one network (Solana has no layer 2s to add). A Bitcoin wallet is bound to its one network too. |
+| `add_token`, `remove_token` | yes | **no** | **no** | **no** | a Sui or Solana wallet lists every coin or token it holds automatically. Bitcoin has no tokens. |
+| `revoke_token_approval` | yes | **no** | **no** | **no** | Sui has no token allowances; Solana delegates are shown by `simulate_transaction` / `wc_review_request` |
+| `wc_*` (WalletConnect) | yes | yes | yes | **no** | Sui uses the `sui` WalletConnect namespace and Solana the `solana` namespace (see "WalletConnect (any dapp)"); the Sui signing tools also mirror the Wallet Standard (see "Sui wallets"), and Solana follows Phantom (see "Solana wallets"). Bitcoin wallets are refused by these tools. |
 
 A wallet given to a tool for another blockchain is refused with a clear message before anything is decrypted; chain-specific arguments given to the wrong wallet (for example `chain_id` for Sui or Solana) are refused too.
 
 - `get_info` - returns "All-in-one crypto wallet for Agents. Built from the ground up in Rust." and "Version 0.0".
-- `create_wallet` (blockchain = `ethereum`, `sui` or `solana`, wallet_name, password, optional network) - new wallet with a 24-word seed phrase in a password-encrypted vault. Multiple wallets are supported. `network` is for Sui and Solana only.
+- `create_wallet` (blockchain = `ethereum`, `sui`, `solana` or `bitcoin`, wallet_name, password, optional network) - new wallet with a 24-word seed phrase in a password-encrypted vault. Multiple wallets are supported. `network` is for Sui, Solana and Bitcoin only (Bitcoin: `mainnet`, `testnet` or `signet`).
 - `import_wallet` (wallet_name, password, seed_phrase *or* private_key, optional blockchain / network) - add an existing wallet; `blockchain` defaults to `ethereum`.
 - `list_wallets` - names and blockchains only; no password.
 - `rename_wallet` (wallet_name, new_wallet_name, password) - added beyond the original list.
 - `delete_wallet` (wallet_name, password, confirm=true) - added beyond the original list; irreversible.
 - `get_wallet_address` (wallet_name, password)
 - `get_wallet_balances` (wallet_name, password, optional chain_id / token_contracts) - each asset with amount, USDC value, and chain ID, across all of the wallet's networks. Checks the native coin, a built-in list of well-known tokens, tokens saved with `add_token`, and any token contracts you pass for a one-off check. `usdc_value` is null when no real market price exists (testnets, unlisted tokens).
-- `send_asset` (wallet_name, chain_id, asset = `native` or token contract, to, amount, password) - signs and broadcasts.
+- `send_asset` (wallet_name, chain_id, asset = `native` or token contract, to, amount, password) - signs and broadcasts. Bitcoin: `asset` is `native`, `amount` is in BTC, and optional `fee_rate` (sat/vB) or `confirmation_target` (blocks) chooses the fee.
 - `sign_contract_transaction` (wallet_name, chain_id, password, to, data, optional value / gas_limit / broadcast) - signs a smart-contract call; only broadcasts if `broadcast=true`. Decodes token transfers/approvals and warns about unlimited approvals.
 - `sign_personal_message` (wallet_name, password, message, optional message_format = `text` / `hex` / `base64`) - added for Sui's Wallet Standard `signPersonalMessage` and offered for both blockchains: Ethereum signs with EIP-191 `personal_sign`; Sui signs with Sui's personal-message intent. Nothing is sent and no network access is needed. The response shows the message text (or "(binary data)").
-- `estimate_gas_fee` (wallet_name, chain_id, password, to, optional value / data, or asset + amount) - gas, fee in native currency and USDC.
-- `simulate_transaction` (same parameters as estimate) - added beyond the original list; dry-runs the transaction before signing and reports success or the revert reason, fees, affordability and a decoded description.
+- `estimate_gas_fee` (wallet_name, chain_id, password, to, optional value / data, or asset + amount) - gas, fee in native currency and USDC. Bitcoin: `to` + `amount` for the exact fee of a payment, or nothing for the current rates by confirmation target.
+- `simulate_transaction` (same parameters as estimate) - added beyond the original list; dry-runs the transaction before signing and reports success or the revert reason, fees, affordability and a decoded description. Bitcoin has no execution to run, so the payment is fully built and signed in memory and checked instead (see "Bitcoin wallets").
 - `read_smart_contract` (wallet_name, chain_id, password, contract, function, optional args / outputs) - added beyond the original list; read-only call, nothing is signed.
 - `get_transaction` (wallet_name, chain_id, password, transaction_hash) - added beyond the original list; status, confirmations, fee paid.
 - `get_transaction_history` (wallet_name, chain_id, password, optional type / limit) - added beyond the original list; uses the network's Blockscout-compatible explorer API.
@@ -74,12 +74,12 @@ A wallet given to a tool for another blockchain is refused with a clear message 
 - `list_networks` (wallet_name, password) - helper for viewing a wallet's networks. Deleting a network also removes the tokens added on it.
 - `add_token` (wallet_name, chain_id, contract, password) - added beyond the original list; saves an ERC-20 token to the wallet on that network (any network the wallet has). The contract is checked on-chain and its symbol and decimals are read from it. Added tokens always appear in `get_wallet_balances`, even at zero. Stored in the encrypted vault; max 50 per network.
 - `remove_token` (wallet_name, chain_id, contract, password) - added beyond the original list; stops tracking an added token (no funds move). Built-in well-known tokens cannot be removed.
-- `get_swap_quote` (wallet_name, password, from_chain_id, from_token, to_chain_id, to_token, amount, optional slippage_bps / to_address) - added by request; previews a swap (OpenOcean on Ethereum, Cetus on Sui, Jupiter on Solana) without signing or sending anything: how much of the new token you will get (expected and guaranteed minimum), the fees (service fee, estimated network fee), the route, price impact, and whether an approval or more balance is needed.
+- `get_swap_quote` (wallet_name, password, from_chain_id, from_token, to_chain_id, to_token, amount, optional slippage_bps / to_address) - added by request; previews a swap (OpenOcean on Ethereum, Cetus on Sui, Jupiter on Solana; not available for Bitcoin) without signing or sending anything: how much of the new token you will get (expected and guaranteed minimum), the fees (service fee, estimated network fee), the route, price impact, and whether an approval or more balance is needed.
 - `swap_tokens` (same parameters plus optional min_receive) - swaps and broadcasts (Ethereum: OpenOcean; Sui: Cetus; Solana: Jupiter). Tokens are a contract address or `native`. If the sold token needs an approval, exactly the sold amount is approved first (a non-zero allowance is reset to zero first, as USDT requires) and confirmed before the swap is sent. `min_receive` is a safety floor: if the fresh quote's guaranteed minimum is lower, nothing is sent.
 - `view_seed_phrase`, `view_private_key` (wallet_name, password)
 - `export_wallet` (wallet_name, password, encryption_key, optional file_name) - writes a ZIP to `exports/` whose single entry (`agent-saifu-wallet-export.json`) is the seed phrase and private key encrypted with MetaMask's vault scheme under the given key. Never overwrites files. The ZIP itself has no ZIP password; the entry is a MetaMask-style vault (`{data, iv, salt, keyMetadata}`, PBKDF2-HMAC-SHA256 + AES-256-GCM). **To open it later you need only the ZIP and the `encryption_key` used when exporting.** The wallet's password is needed only to create the export, not to open it, and neither key is stored anywhere, so a lost `encryption_key` cannot be recovered. The key must be at least 12 characters.
 - `revoke_token_approval` (wallet_name, chain_id, password, token, spender) - useful for revoking smart-contract token approvals (sets the ERC-20 allowance to zero).
-- `wc_pair` (uri, optional wait_seconds) - added by request; connects to any dapp over WalletConnect v2, Ethereum, Sui or Solana. Give it the `wc:` URI the dapp shows. It waits for the dapp's session proposal and returns what the dapp asks for (chains, methods, whether this wallet can satisfy it). Nothing is shared until the proposal is approved. No wallet is unlocked.
+- `wc_pair` (uri, optional wait_seconds) - added by request; connects to any dapp over WalletConnect v2, Ethereum, Sui or Solana (not Bitcoin). Give it the `wc:` URI the dapp shows. It waits for the dapp's session proposal and returns what the dapp asks for (chains, methods, whether this wallet can satisfy it). Nothing is shared until the proposal is approved. No wallet is unlocked.
 - `wc_list_proposals`, `wc_reject_session` (proposal_id) - waiting connection proposals; decline one.
 - `wc_approve_session` (proposal_id, wallet_name, password, chain_id for Ethereum wallets, optional additional_chain_ids) - approves a proposal with a wallet; this is the only step that reveals the address, and only to the dapp. Ethereum: the chains must cover everything the dapp requires and may only include chains the dapp asked for; the wallet needs a network for each. Sui: omit `chain_id` / `additional_chain_ids`; the dapp is connected on the wallet's own network (`sui:mainnet`, `sui:testnet` or `sui:devnet`). Solana: the same; the dapp is connected on the wallet's own cluster (`solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` for mainnet, `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` for devnet, `solana:4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z` for testnet).
 - `wc_list_sessions`, `wc_disconnect_session` (session_topic) - connected dapps (wallet, chains, methods; never addresses); end one.
@@ -155,6 +155,26 @@ Sui swaps go through the [Cetus aggregator](https://cetus-1.gitbook.io/cetus-dev
 - **Costs to know about.** The pools charge their own trading fee inside the price (shown per hop as `fee_rate`); the network fee is paid in SUI.
 - **Known limits.** The aggregator's public API has a rate limit; tiny amounts are often refused by the price-deviation check; Sui coins without metadata cannot be swapped; a quote moves with the market, so `swap_tokens` fetches a fresh one.
 
+### Bitcoin wallets
+
+Bitcoin wallets are created and used like the other chains' wallets (same vault encryption, per-call unlocking, password rate limiting, tools), with these specifics. They follow Bitcoin Core's wallet behaviour and the relevant BIPs (32, 39, 84, 125, 141, 143, 173, 322, 350) wherever that matters for safety. The cryptography uses `k256` (already a dependency for Ethereum); everything else (RIPEMD-160, Bech32/Bech32m, Base58Check, transaction encoding, BIP 143 signature hashes, coin selection, the Esplora client) is implemented in this repository, with no Bitcoin library.
+
+- **One address.** A Bitcoin wallet has exactly one address, native SegWit (P2WPKH, `bc1q...`), the type Bitcoin Core creates by default. A 24-word BIP 39 seed phrase derives the key with BIP 32 at the BIP 84 path `m/84'/0'/0'/0/0` (`m/84'/1'/0'/0/0` on the test networks, SLIP-44 coin type 1), the first receiving address of the first account in Sparrow, Electrum (BIP 39 mode), Ledger, Trezor and other wallets, so a phrase from them gives the same address (checked against BIP 84's published test vector for the standard test phrase, and independently re-derived in Python for a 24-word phrase). Change goes back to the same address; there are no extra addresses, account discovery or coin control. Imported private keys may be a compressed WIF key (`K...` / `L...`, `c...` on test networks) or 64 hex digits; an uncompressed WIF key is refused (a native SegWit address cannot use one) and so is a WIF key of another network. `view_private_key` shows the WIF key (plus hex).
+- **Self-custody and vault.** The vault is the same PBKDF2-SHA256 900,000 iterations + AES-256-GCM format with MetaMask's keyring layout used by every other wallet (Bitcoin Core's own wallet encryption is AES-256-CBC with a weaker key derivation, so this project's vault was kept). The network is stored inside the vault; the wallet file holds only the name, blockchain and vault, so the address is not visible until unlock. The same attempt limiter (five wrong passwords lock a wallet for 60 seconds) covers Bitcoin wallets, and unlocking one wallet never unlocks another.
+- **One network per wallet.** `mainnet` (default), `testnet` (testnet4, BIP 94; the old testnet3 is retired) or `signet`, recorded inside the vault. An address of another network is refused as a recipient (the `bc` / `tb` prefix and the legacy version bytes are checked), a WIF key of another network is refused on import, and every call first checks that the API really follows that chain by the hash of its genesis block, so a testnet key never signs for mainnet.
+- **Recipients.** P2PKH (`1...`), P2SH (`3...`), P2WPKH (`bc1q...`), P2WSH (`bc1q...`, 62 characters) and P2TR (`bc1p...`) addresses are accepted, with the BIP 173 and BIP 350 rules (Bech32 for version 0, Bech32m for version 1, mixed case and wrong checksums refused). SegWit versions above 1 are refused because funds sent to a witness program nothing can spend yet might be unrecoverable. Sending to the wallet's own address is refused.
+- **Node access.** Balances, unspent coins, fee estimates, transactions and broadcasting use an Esplora-compatible HTTP API over HTTPS with certificate checking. The endpoints are `blockstream.info` (mainnet) and `mempool.space` (testnet4 and signet), set in [core/src/bitcoin_config.rs](core/src/bitcoin_config.rs); replace them with your own Esplora's URL (https, or http for localhost only) for privacy or heavier use. The server is untrusted: its answers are parsed strictly and bounded, the wallet builds and signs the transaction itself, and a lie about a coin's value only produces a signature the network rejects (a SegWit signature commits to the value it spends). The server learns the wallet's address and IP address, like any light wallet.
+- **Balances.** `balance` is the address's confirmed balance plus its unconfirmed net change (shown separately as `confirmed_balance` and `unconfirmed_change`). `usdc_value` comes from CoinGecko on mainnet and is `null` on test networks.
+- **Sending.** `send_asset` follows Bitcoin Core's wallet rules: the payment is refused if it is below the dust threshold for the recipient's script (294 satoshis for P2WPKH, 330 for P2WSH and P2TR, 546 for P2PKH, 540 for P2SH; computed as Core does at 3 sat/vB); coins that cost more to spend than they are worth at the chosen fee rate are left alone; change below the dust threshold is added to the fee instead of creating a dust output; the fee may not exceed Core's default `-maxtxfee` of 0.1 BTC; and a transaction above the standard weight of 400,000 is refused. Coin selection takes the smallest single coin that covers the payment, otherwise the largest coins until it is covered, then drops any that were not needed. The transaction is version 2, signals replaceability (BIP 125, sequence `0xfffffffd`, Core's default), and sets `nLockTime` to the current block height (Core's anti-fee-sniping measure). Only confirmed coins and the wallet's own unconfirmed change (the parent transaction must be funded entirely by this wallet) are spent; unconfirmed payments from others are not, and the error says how much is waiting. The recipient and amount are exactly what was asked for.
+- **Fees.** The default is the Esplora estimate for confirming within 6 blocks (Core's default target); `confirmation_target` (1 to 1008) picks another, and `fee_rate` (1 to 1000 sat/vB, up to three decimals) sets one explicitly (not together). Rates are integers in thousandths of a satoshi per virtual byte, the fee is rounded up, and it is charged on the transaction's virtual size sized with the largest possible signature, so the real rate is never below the chosen one. A fee estimate below 1 sat/vB (the long-standing minimum relay fee) is raised to it, an estimate above 1,000 sat/vB from the server is refused rather than followed, and when the fee comes from an estimate it may not exceed the amount sent (give `fee_rate` to proceed anyway). Fees of 5% or more of the amount are flagged.
+- **Signatures and final checks.** Inputs are native SegWit, signed with BIP 143 `SIGHASH_ALL`, deterministic (RFC 6979) and low-S as relay policy requires. Every signature is verified against the public key before it is used (as Core does), and the finished transaction is checked against the plan: exactly the requested payment to exactly the requested script, change only to the wallet's own script, no duplicate or unsigned input, the fee equal to the plan, within limits and at least 1 sat/vB, and no larger than estimated. The signing code reproduces the BIP 143 and BIP 322 published test vectors.
+- **Lost answers.** Before every broadcast the signed transaction (id and raw bytes, no keys) is saved in `$AGENT_SAIFU_HOME/pending/` under a name that is a hash of the wallet's script. If the answer is lost, the transaction id is looked up: if the node has it, it is reported as accepted; otherwise the error returns the transaction id and says not to send again. The next send from that wallet first settles the record: if the node has the transaction nothing new is sent and the agent is told; if not, the identical signed transaction is submitted again (the same inputs, so it can never pay twice) and reported; if the node cannot be reached nothing is sent; and a transaction the network rejects is discarded.
+- **Simulation and estimates.** Bitcoin has no execution to dry-run. `simulate_transaction` builds the payment, signs it in memory, verifies it and reports `would_succeed`, the fee and rate, the change, the wallet's balance change and the transaction id the real send would produce, without sending anything; a payment the wallet cannot make (not enough spendable coins, dust, fee limits) is reported as `would_succeed: false` with the reason. `estimate_gas_fee` reports the fee of a payment, or without one the current rates by confirmation target and the cost of a typical 141-virtual-byte payment.
+- **Messages.** `sign_personal_message` signs with BIP 322 ("simple", for P2WPKH): the message is committed to by a virtual transaction that spends an output that does not exist, so the signature can never be replayed as a payment. The response has the signature with BIP 322's `smp` prefix and also without it (for verifiers written before the prefix existed). Bitcoin Core's own `signmessage` supports only legacy P2PKH addresses and cannot check these.
+- **Lookups.** `get_transaction` takes the 64-hex-digit transaction id and reports status, confirmations, block, fee, size, whether the wallet received or sent, its balance change and the outputs. `get_transaction_history` lists the address's transactions (unconfirmed first, then confirmed, newest first) with the wallet's balance change for each.
+- **Not supported.** Swaps (no aggregator serves native Bitcoin), WalletConnect, PSBTs and other externally built transactions (`sign_contract_transaction`), several addresses, coin control, fee bumping and hardware wallets. The address is P2WPKH only; Taproot and legacy addresses can be paid but not held.
+- **Text from the network** (addresses, errors) is length-limited and stripped of control characters before it reaches the agent.
+
 ### WalletConnect (any dapp)
 
 The wallet speaks the WalletConnect v2 Sign protocol as the wallet side, so any dapp that shows a WalletConnect QR code or `wc:` link can connect: Uniswap, OpenSea, Aave, and so on. The flow for an agent:
@@ -193,11 +213,11 @@ The wallet speaks the WalletConnect v2 Sign protocol as the wallet side, so any 
 
 - Vault encryption matches MetaMask's `browser-passworder`: PBKDF2-HMAC-SHA256 (900,000 iterations, 32-byte salt) derives an AES-256-GCM key (16-byte IV); the vault is `{data, iv, salt, keyMetadata}` in base64. The vault plaintext uses MetaMask's keyring layout (`HD Key Tree` / `Simple Key Pair`). Verified against vaults produced and read by WebCrypto.
 - The wallet file holds only the name, blockchain and vault. Addresses, balances, networks, added tokens and keys exist only inside the encrypted vault. Files are `0600`, directories `0700`; writes are atomic and never overwrite exports.
-- Seed phrases are always 24 words (BIP39, checksum-validated); Ethereum keys derive at `m/44'/60'/0'/0/0`, Sui keys (Ed25519, SLIP-0010) at `m/44'/784'/0'/0'/0'`, Solana keys (Ed25519, SLIP-0010) at `m/44'/501'/0'/0'`.
-- Passwords must be at least 8 characters (export keys 12). Five wrong passwords lock a wallet for 60 seconds (the same limiter covers Ethereum, Sui and Solana wallets). A tool for one blockchain given a wallet of another is refused before anything is decrypted.
+- Seed phrases are always 24 words (BIP39, checksum-validated); Ethereum keys derive at `m/44'/60'/0'/0/0`, Sui keys (Ed25519, SLIP-0010) at `m/44'/784'/0'/0'/0'`, Solana keys (Ed25519, SLIP-0010) at `m/44'/501'/0'/0'`, Bitcoin keys (secp256k1, BIP 84, native SegWit) at `m/84'/0'/0'/0/0` (`m/84'/1'/0'/0/0` on test networks).
+- Passwords must be at least 8 characters (export keys 12). Five wrong passwords lock a wallet for 60 seconds (the same limiter covers Ethereum, Sui, Solana and Bitcoin wallets). A tool for one blockchain given a wallet of another is refused before anything is decrypted.
 - Secrets are wiped from memory after each call where possible; request/response buffers are zeroed. Secrets are never logged and are never included in error messages.
 - Text coming from third parties (token names, explorer data) is shortened and stripped of control characters before it reaches an agent; RPC URLs must be https (http only for localhost) and may not be literal private-network IPv4 addresses.
-- No double payments on a lost broadcast response. Before every broadcast the signed transaction (hash, nonce, raw bytes; no keys) is saved in `$AGENT_SAIFU_HOME/pending/` and removed once the node answers. If the response is lost (timeout, network error), the record stays and the error says the outcome is unknown and not to retry. The next send from that wallet on that network first looks the transaction up: if the node has it, nothing is sent and the agent is told it was already accepted; if not, the identical signed bytes are resubmitted (same nonce, so never a second payment) and reported; if the node can't be reached, nothing is sent until it can be checked.
+- No double payments on a lost broadcast response. Before every broadcast the signed transaction (hash, nonce, raw bytes; no keys) is saved in `$AGENT_SAIFU_HOME/pending/` and removed once the node answers. Bitcoin payments are recorded the same way (see "Bitcoin wallets"). If the response is lost (timeout, network error), the record stays and the error says the outcome is unknown and not to retry. The next send from that wallet on that network first looks the transaction up: if the node has it, nothing is sent and the agent is told it was already accepted; if not, the identical signed bytes are resubmitted (same nonce, so never a second payment) and reported; if the node can't be reached, nothing is sent until it can be checked.
 
 ### Dependencies
 
@@ -216,11 +236,12 @@ Sui support uses the official Sui Rust SDK (https://github.com/MystenLabs/sui-ru
 - `sui-sdk-types` 0.4 (Sui transaction/address/type definitions, BCS encoding, digests; ~359k downloads), `sui-crypto` 0.4 (Ed25519 keys, `suiprivkey` Bech32, transaction and personal-message signing in Sui's intent scheme; ~122k downloads) and `sui-transaction-builder` 0.4 (offline programmable-transaction builder, `intents` feature off; ~116k downloads). These have far fewer downloads than the other crates above because Sui's Rust SDK is young and specialised, but they are the SDK Mysten Labs publishes for this purpose; their signing and addressing output was also cross-checked against independent implementations (see the tests). Their dependencies are widely used RustCrypto/serde crates (`ed25519-dalek` 2.2 ~249M downloads, `curve25519-dalek` 4.1.3, `blake2` ~188M, `sha2`, `bcs` ~9.8M, `bech32` ~64M, `bs58` ~168M, `serde_with` ~412M, `roaring` ~59M, `bnum` ~21M).
 - SLIP-0010 (Ed25519 key derivation), the MetaMask-style Sui vault, GraphQL access and the Cetus aggregator integration are implemented in this repository.
 - Solana support adds **no new crates**: Ed25519 uses `ed25519-dalek` (already used for relay authentication), and base58, SLIP-0010, the transaction format (legacy and version 0 messages), program-derived addresses, instruction decoding, the JSON-RPC client and the OpenOcean integration are implemented in this repository. Everything was checked against independent computations (a Python implementation of the derivation, Ed25519 signing and the message layout; Phantom's published address for a standard phrase; an associated token account address listed by a mainnet node) and, for signatures, against a live node that verified a wallet-signed transaction.
+- Bitcoin support adds **no new crates**: secp256k1 signing and verification use `k256` (already used for Ethereum), and RIPEMD-160, Bech32 / Bech32m, Base58Check, BIP 32 / BIP 84 derivation, transaction encoding, BIP 143 signature hashes, BIP 322 message signing, coin selection and the Esplora client are implemented in this repository, with the HTTPS transport shared with the other chains. Everything was checked against published vectors (BIP 173 / 350 address vectors, BIP 84's derivation vector, BIP 143's signature hash, BIP 322's message hashes, transaction ids and signatures, including signatures produced by other implementations, and RIPEMD-160's reference vectors), an independent Python derivation of a 24-word phrase, and against the live signet and mainnet Esplora APIs (reads, fee estimates, and a wallet-signed transaction that a real signet node decoded and rejected only for spending a coin that does not exist).
 - Audit result (RustSec advisory database checked on 2026-10-24 against every package in `Cargo.lock`): no advisory applies to the locked versions of the new Sui dependencies (`ed25519-dalek` 2.2.0 and `curve25519-dalek` 4.1.3 are past RUSTSEC-2022-0093 and RUSTSEC-2024-0344). The audit also found two timing advisories published the day before, RUSTSEC-2026-0385 (`ctutils`) and RUSTSEC-2026-0387 (`crypto-bigint`), in crates that `k256` already pulled in for Ethereum signing; `Cargo.lock` now pins their patched versions (`ctutils` 0.4.5, `crypto-bigint` 0.7.6). One informational notice remains: `ring` 0.17.14 is flagged "unmaintained" (RUSTSEC-2025-0007) through `rustls`, which was already the case.
 
 ### External services
 
-Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). The WalletConnect relay (`relay.walletconnect.org`, needs a free project ID). Custom networks supply their own RPC and explorer. For Sui: the network's GraphQL endpoint (`graphql.mainnet.sui.io`, `graphql.testnet.sui.io` or `graphql.devnet.sui.io`; reads, dry runs, submission) and the Cetus aggregator (`api-sui.cetus.zone`, routes for swaps and indicative prices; no key); SUI prices also come from CoinGecko. For Solana: the cluster's JSON-RPC endpoint (`api.mainnet-beta.solana.com`, `api.devnet.solana.com` or `api.testnet.solana.com`, configurable in `core/src/solana_config.rs`; reads, simulation, submission), the Jupiter Swap API (`api.jup.ag/swap/v2/build`, swaps; keyless, no key), `explorer.solana.com` links, and CoinGecko for SOL and token prices.
+Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). The WalletConnect relay (`relay.walletconnect.org`, needs a free project ID). Custom networks supply their own RPC and explorer. For Sui: the network's GraphQL endpoint (`graphql.mainnet.sui.io`, `graphql.testnet.sui.io` or `graphql.devnet.sui.io`; reads, dry runs, submission) and the Cetus aggregator (`api-sui.cetus.zone`, routes for swaps and indicative prices; no key); SUI prices also come from CoinGecko. For Solana: the cluster's JSON-RPC endpoint (`api.mainnet-beta.solana.com`, `api.devnet.solana.com` or `api.testnet.solana.com`, configurable in `core/src/solana_config.rs`; reads, simulation, submission), the Jupiter Swap API (`api.jup.ag/swap/v2/build`, swaps; keyless, no key), `explorer.solana.com` links, and CoinGecko for SOL and token prices. For Bitcoin: an Esplora-compatible API (`blockstream.info/api` for mainnet, `mempool.space/testnet4/api` and `mempool.space/signet/api`, configurable in `core/src/bitcoin_config.rs`; reads, fee estimates, broadcasting), `mempool.space` explorer links, and CoinGecko for BTC prices.
 
 ## Usage Examples
 
@@ -643,6 +664,82 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"view_priva
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_networks","arguments":{"wallet_name":"Sol Demo","password":"demo-password-123"}}}' | cargo run -q
 ```
 
+### Bitcoin wallets
+
+Bitcoin wallets use the same tools; there is no `chain_id` (the wallet is bound to the network it was created for). Create one (mainnet by default; add `"network":"signet"` or `"testnet"` for a test wallet):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_wallet","arguments":{"blockchain":"bitcoin","wallet_name":"BTC Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_wallet","arguments":{"blockchain":"bitcoin","wallet_name":"BTC Signet","password":"demo-password-123","network":"signet"}}}' | cargo run -q
+```
+
+Import a seed phrase (24 words, derived at `m/84'/0'/0'/0/0` like Sparrow, Ledger and Trezor; the well-known public test phrase below must never be used for real funds) or a WIF private key:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"import_wallet","arguments":{"blockchain":"bitcoin","wallet_name":"BTC Imported","password":"import-password-1","seed_phrase":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"import_wallet","arguments":{"blockchain":"bitcoin","wallet_name":"BTC Key","password":"import-password-2","private_key":"<WIF private key>"}}}' | cargo run -q
+```
+
+The address (one native SegWit address per wallet) and the balance, confirmed and unconfirmed, with a USD value on mainnet:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet_address","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_wallet_balances","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+Current fee rates (no payment given), then the exact fee of a payment, then a full dry run that builds and signs the payment in memory without sending it (`fee_rate` in sat/vB or `confirmation_target` in blocks are optional; the default targets 6 blocks):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"estimate_gas_fee","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"estimate_gas_fee","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123","to":"<recipient address>","amount":"0.001","confirmation_target":2}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"simulate_transaction","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123","to":"<recipient address>","amount":"0.001"}}}' | cargo run -q
+```
+
+Send BTC (spends real funds if the wallet is funded; `asset` is `native`, the amount is in BTC):
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_asset","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123","asset":"native","to":"<recipient address>","amount":"0.001","fee_rate":"5"}}}' | cargo run -q
+```
+
+Sign a message with BIP 322, look up a transaction by its id, and list recent activity:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sign_personal_message","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123","message":"I own this address"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_transaction","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123","transaction_hash":"<64-hex transaction id>"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_transaction_history","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123","limit":5}}}' | cargo run -q
+```
+
+The key as a WIF string Bitcoin Core, Sparrow and Electrum import (plus hex), and the network the wallet is bound to:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"view_private_key","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_networks","arguments":{"wallet_name":"BTC Demo","password":"demo-password-123"}}}' | cargo run -q
+```
+
 ### Several requests in one session
 
 Piping multiple lines runs them in one server process (one JSON message per line; notifications get no reply):
@@ -672,4 +769,4 @@ Lessons from using WalletConnect with Ethereum, Sui and Solana dapps (Sui was te
 
 ## Planned Features
 
-None at the moment.
+None at the moment. Bitcoin deliberately starts simple (one address per wallet, no coin control); more addresses, UTXO management, PSBT signing and fee bumping (RBF, CPFP) can follow.

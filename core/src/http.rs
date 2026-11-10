@@ -8,6 +8,11 @@ pub const TIMEOUT: Duration = Duration::from_secs(25);
 pub trait HttpClient {
     fn get(&self, url: &str) -> Result<String, String>;
     fn post_json(&self, url: &str, body: &str) -> Result<String, String>;
+
+    /// POSTs a plain-text body (Bitcoin's Esplora API takes a raw transaction this way).
+    fn post_text(&self, _url: &str, _body: &str) -> Result<String, String> {
+        Err("this HTTP client cannot send plain-text requests".to_string())
+    }
 }
 
 /// Real transport: HTTPS through `ureq` + rustls, no redirects, bounded size and time.
@@ -88,6 +93,27 @@ impl HttpClient for UreqClient {
             .post(url)
             .header("content-type", "application/json")
             .header("accept", "application/json")
+            .send(body)
+            .map_err(|e| format!("request failed: {e}"))?;
+        let status = response.status().as_u16();
+        let text = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
+            .read_to_string()
+            .map_err(|e| format!("could not read response: {e}"))?;
+        if !(200..300).contains(&status) {
+            return Err(describe(status, &text));
+        }
+        Ok(text)
+    }
+
+    fn post_text(&self, url: &str, body: &str) -> Result<String, String> {
+        let mut response = self
+            .agent
+            .post(url)
+            .header("content-type", "text/plain")
+            .header("accept", "text/plain, application/json")
             .send(body)
             .map_err(|e| format!("request failed: {e}"))?;
         let status = response.status().as_u16();

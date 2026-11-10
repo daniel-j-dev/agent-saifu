@@ -1,11 +1,11 @@
 ---
 name: agent-saifu
-description: Use the agent-saifu MCP server, an all-in-one crypto wallet for AI agents (Ethereum, EVM layer 2s, Sui and Solana). Use it to create or import wallets, check balances, send assets, swap tokens, sign transactions and messages, and connect to dapps over WalletConnect. Read this before calling any wallet tool, and before connecting a dapp.
+description: Use the agent-saifu MCP server, an all-in-one crypto wallet for AI agents (Ethereum, EVM layer 2s, Sui, Solana and Bitcoin). Use it to create or import wallets, check balances, send assets, swap tokens, sign transactions and messages, and connect to dapps over WalletConnect. Read this before calling any wallet tool, and before connecting a dapp.
 ---
 
 # agent-saifu: crypto wallet for agents
 
-agent-saifu is a Rust MCP server (stdio JSON-RPC) that holds wallets and signs for you. It supports **Ethereum** (plus any EVM layer 2 you add, chosen per call with `chain_id`), **Sui** and **Solana** (a Sui or Solana wallet is bound to one network, so there is no `chain_id`). Bitcoin is not supported yet.
+agent-saifu is a Rust MCP server (stdio JSON-RPC) that holds wallets and signs for you. It supports **Ethereum** (plus any EVM layer 2 you add, chosen per call with `chain_id`), **Sui**, **Solana** and **Bitcoin** (a Sui, Solana or Bitcoin wallet is bound to one network, so there is no `chain_id`; a Bitcoin wallet has exactly one native SegWit address).
 
 Full detail (every tool, parameters, security design, worked examples) is in `spec.md`, shipped next to this file. Read it when this summary is not enough.
 
@@ -31,7 +31,7 @@ Wherever this file says "ask the user" or "when the user says to approve", an op
 
 ## Ground rules
 
-- **Real funds.** Wallets usually hold real mainnet money, and sends, swaps and approvals are irreversible. Never spend, swap, send, approve a dapp request or export keys unless your principal told you to (an operated agent: the user said so; an autonomous agent: your mandate covers it). Confirm the recipient, asset and amount first. Sui recipients must be written out in full (`0x` plus 64 hex characters), and Solana recipients are base58 wallet addresses (never a program address). Autonomous agents should also keep to any amount limits in their mandate.
+- **Real funds.** Wallets usually hold real mainnet money, and sends, swaps and approvals are irreversible. Never spend, swap, send, approve a dapp request or export keys unless your principal told you to (an operated agent: the user said so; an autonomous agent: your mandate covers it). Confirm the recipient, asset and amount first. Sui recipients must be written out in full (`0x` plus 64 hex characters), Solana recipients are base58 wallet addresses (never a program address), and Bitcoin recipients must be addresses of the wallet's own network (`bc1...`, `1...` or `3...` on mainnet; `tb1...`, `m...`, `n...` or `2...` on testnet and signet). Autonomous agents should also keep to any amount limits in their mandate.
 - **Passwords, seed phrases and private keys.** Every tool that touches a wallet needs `wallet_name` and `password`. The wallet is unlocked for that one call and locked again on return; unlocking one wallet never unlocks another. A wrong password is rate limited. Anyone who gets a seed phrase or private key controls the funds permanently, and a password plus the vault file does the same.
   - **Operated agent:** never store, log or repeat the user's password, seed phrase or private key beyond what the user asked for. Show a seed phrase or key (`view_seed_phrase`, `view_private_key`, `export_wallet`) only when the user asks.
   - **Autonomous agent:** the secrets are yours to handle as your mandate needs; nobody is there to ask. You decide where the password lives and when to read the seed phrase, and you are responsible for keeping every wallet's backup, private key and seed phrase safe and findable (see "Backing up a wallet"). Strong recommendations:
@@ -40,7 +40,7 @@ Wherever this file says "ask the user" or "when the user says to approve", an op
     - Use one wallet per purpose, funded only with what the task needs, so a leak costs little. Give separate wallets different passwords.
     - Use long, random, unique passwords (not examples like `demo-password-123`), and keep a backup of the seed phrase offline so losing the password or vault is recoverable.
     - Never paste a secret into a dapp, a web form or a message to anyone. Only the `wc_*` tools talk to dapps, and they never reveal secrets.
-- **Pick tools by wallet type.** Most tools work for all three blockchains. Ethereum-only tools: `read_smart_contract`, `add_network`, `update_network`, `delete_network`, `add_token`, `remove_token`, `revoke_token_approval`. Giving `chain_id` to a Sui or Solana wallet, or a Sui or Solana wallet to an Ethereum-only tool, is refused.
+- **Pick tools by wallet type.** Most tools work for all four blockchains. Ethereum-only tools: `read_smart_contract`, `add_network`, `update_network`, `delete_network`, `add_token`, `remove_token`, `revoke_token_approval`. Giving `chain_id` to a Sui, Solana or Bitcoin wallet, or one of those wallets to an Ethereum-only tool, is refused. A Bitcoin wallet does not support `sign_contract_transaction`, `get_swap_quote`, `swap_tokens` or the `wc_*` tools (they refuse it with an explanation).
 - **Look before you act.** Use `simulate_transaction` and `estimate_gas_fee` for sends, and `get_swap_quote` before `swap_tokens`. Always check balances with `get_wallet_balances` after a transaction and report the result honestly, including failures.
 - **Report what you did:** the transaction hash, digest or signature, amounts, and anything left over (for example SUI, SOL or ETH held back for gas). An operated agent tells the user; an autonomous agent writes it to its log or output.
 
@@ -49,9 +49,9 @@ Wherever this file says "ask the user" or "when the user says to approve", an op
 | Task | Tools |
 |---|---|
 | See wallets | `list_wallets` (no password) |
-| Create or import | `create_wallet` (`blockchain` = `ethereum`, `sui` or `solana`, optional Sui or Solana `network`), `import_wallet` |
+| Create or import | `create_wallet` (`blockchain` = `ethereum`, `sui`, `solana` or `bitcoin`, optional Sui, Solana or Bitcoin `network`), `import_wallet` |
 | Address and balances | `get_wallet_address`, `get_wallet_balances` |
-| Send | `send_asset` (`asset` = `native`, an ERC-20 address, a Sui coin type like `0x2::sui::SUI`, or a Solana token mint address) |
+| Send | `send_asset` (`asset` = `native` (the only Bitcoin asset), an ERC-20 address, a Sui coin type like `0x2::sui::SUI`, or a Solana token mint address; Bitcoin also takes optional `fee_rate` or `confirmation_target`) |
 | Swap | `get_swap_quote`, then `swap_tokens` (OpenOcean on Ethereum, Jupiter on Solana mainnet, Cetus on Sui mainnet) |
 | Sign | `sign_contract_transaction`, `sign_personal_message` |
 | History and status | `get_transaction`, `get_transaction_history` |
@@ -64,6 +64,7 @@ Notes that save time:
 - Swaps are same-chain only. `min_receive` is a safety floor; on Sui pairs other than SUI/USDC it is required.
 - Solana: a token send opens the recipient's token account if they have none (a refundable deposit of about 0.00204 SOL paid by the sender). Unrecognised tokens in `get_wallet_balances` are often spam airdrops; never interact with a token you do not know. `sign_personal_message` refuses bytes that are a valid Solana transaction. The OpenOcean swap host can answer that Solana is unsupported (`get_swap_quote` then explains it and nothing is sent).
 - Sending a wallet's entire SUI, SOL or ETH balance needs a gas reserve, so a few dust units will remain. On Sui, one send can spend at most about the larger of the coin-object balance and the address balance, so a very large send may need to be split into two.
+- Bitcoin: amounts are in BTC (at most 8 decimals). The fee is chosen by `fee_rate` (sat/vB, 1 to 1000) or `confirmation_target` (blocks, default 6). The wallet spends confirmed coins and its own unconfirmed change only, pays change back to its single address, and refuses dust and fees above Bitcoin Core's limits. A Bitcoin payment is replaceable until it confirms; check it with `get_transaction`. If an answer is lost the error gives the transaction id and the next send reconciles it, so never retry by hand. `simulate_transaction` fully builds and signs the payment in memory without sending it. `sign_personal_message` makes a BIP 322 signature.
 - Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
 
 ## Backing up a wallet (`export_wallet`)

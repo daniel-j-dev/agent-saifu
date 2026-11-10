@@ -61,9 +61,51 @@ pub fn decode_fixed<const N: usize>(text: &str) -> Result<[u8; N], String> {
     <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| format!("expected {N} bytes of base58 data"))
 }
 
+const CHECKSUM_LEN: usize = 4;
+
+/// Base58Check: the payload followed by the first four bytes of its double SHA-256.
+pub fn encode_check(payload: &[u8]) -> String {
+    let mut data = payload.to_vec();
+    data.extend_from_slice(&super::sha2::sha256d(payload)[..CHECKSUM_LEN]);
+    encode(&data)
+}
+
+/// Inverse of `encode_check`; fails when the checksum does not match.
+pub fn decode_check(text: &str) -> Result<Vec<u8>, String> {
+    let data = decode(text)?;
+    if data.len() <= CHECKSUM_LEN {
+        return Err("base58check text is too short".to_string());
+    }
+    let (payload, checksum) = data.split_at(data.len() - CHECKSUM_LEN);
+    if super::sha2::sha256d(payload)[..CHECKSUM_LEN] != *checksum {
+        return Err("base58check checksum is wrong (a character was mistyped)".to_string());
+    }
+    Ok(payload.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_encoding_matches_a_known_address() {
+        // The genesis block's coinbase address (version byte 0 + HASH160 of Satoshi's key).
+        let payload =
+            crate::crypto::hex::decode("0062e907b15cbf27d5425399ebf6f0fb50ebb88f18").unwrap();
+        assert_eq!(encode_check(&payload), "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa");
+        assert_eq!(
+            decode_check("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn check_decoding_refuses_a_bad_checksum() {
+        assert!(decode_check("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb").is_err());
+        assert!(decode_check("1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf").is_err());
+        assert!(decode_check("").is_err());
+        assert!(decode_check("1111").is_err());
+    }
 
     #[test]
     fn known_vectors() {

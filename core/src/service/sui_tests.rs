@@ -246,7 +246,7 @@ fn wallets_can_be_bound_to_testnet_or_devnet_and_networks_are_validated() {
         .service
         .create_wallet_on("ethereum", "E", PW, Some("testnet"))
         .unwrap_err();
-    assert!(err.contains("Sui and Solana wallets only"));
+    assert!(err.contains("Sui, Solana and Bitcoin wallets only"));
     assert!(
         !f.service
             .list_wallets()
@@ -2059,7 +2059,11 @@ fn ethereum_wallets_still_need_their_chain_id_and_reject_sui_arguments() {
         "create_wallet",
         r#"{"blockchain":"ethereum","wallet_name":"E2","password":"correct-horse-battery","network":"testnet"}"#,
     );
-    assert!(err && out.to_json().contains("Sui and Solana wallets only"));
+    assert!(
+        err && out
+            .to_json()
+            .contains("Sui, Solana and Bitcoin wallets only")
+    );
 }
 
 #[test]

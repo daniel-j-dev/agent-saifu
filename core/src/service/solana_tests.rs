@@ -472,7 +472,7 @@ fn wallets_can_be_bound_to_devnet_or_testnet_and_networks_are_validated() {
         .service
         .create_wallet_on("ethereum", "E", PW, Some("devnet"))
         .unwrap_err();
-    assert!(err.contains("Sui and Solana wallets only"));
+    assert!(err.contains("Sui, Solana and Bitcoin wallets only"));
     assert!(f.service.create_wallet_on("sol", "alias", PW, None).is_ok());
 }
 

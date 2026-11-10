@@ -42,6 +42,23 @@ pub fn sign_recoverable(
     Ok((bytes, recid.to_byte()))
 }
 
+/// Checks a compact `r || s` signature over a 32-byte digest against a SEC1 public key
+/// (compressed or uncompressed). High-S signatures are refused too, as Bitcoin's relay policy
+/// does, so a signature this accepts is always standard.
+pub fn verify_low_s(public_key: &[u8], digest: &[u8; 32], signature: &[u8; 64]) -> bool {
+    use k256::ecdsa::signature::hazmat::PrehashVerifier;
+    let Ok(key) = VerifyingKey::from_sec1_bytes(public_key) else {
+        return false;
+    };
+    let Ok(sig) = Signature::from_slice(signature) else {
+        return false;
+    };
+    if sig.normalize_s() != sig {
+        return false;
+    }
+    key.verify_prehash(digest, &sig).is_ok()
+}
+
 /// Recovers the uncompressed public key from a signature (used for self-checks).
 pub fn recover_public_key(
     digest: &[u8; 32],
@@ -169,6 +186,35 @@ mod tests {
             let (sig, _) = sign_recoverable(&key(i), &digest).unwrap();
             assert!(sig[32..] <= half_order[..], "high-S signature for {i}");
         }
+    }
+
+    #[test]
+    fn verify_accepts_only_the_signers_low_s_signatures() {
+        let digest = keccak256(b"message");
+        let (sig, _) = sign_recoverable(&key(1), &digest).unwrap();
+        let public = public_key_compressed(&key(1)).unwrap();
+        assert!(verify_low_s(&public, &digest, &sig));
+        assert!(verify_low_s(
+            &public_key_uncompressed(&key(1)).unwrap(),
+            &digest,
+            &sig
+        ));
+        let other = public_key_compressed(&key(2)).unwrap();
+        assert!(!verify_low_s(&other, &digest, &sig));
+        assert!(!verify_low_s(&public, &keccak256(b"other"), &sig));
+        assert!(!verify_low_s(&[2u8; 5], &digest, &sig));
+        // The same signature with s replaced by n - s is valid ECDSA but high-S.
+        let mut high = sig;
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let mut v = i16::from(SECP256K1_ORDER[i]) - i16::from(sig[32 + i]) - borrow;
+            borrow = i16::from(v < 0);
+            if v < 0 {
+                v += 256;
+            }
+            high[32 + i] = v as u8;
+        }
+        assert!(!verify_low_s(&public, &digest, &high));
     }
 
     #[test]

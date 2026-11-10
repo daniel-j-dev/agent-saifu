@@ -317,10 +317,23 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
     one_shot::<Sha512>(data).try_into().expect("64-byte digest")
 }
 
+/// `SHA256(SHA256(data))`, Bitcoin's transaction and checksum hash.
+pub fn sha256d(data: &[u8]) -> [u8; 32] {
+    sha256(&sha256(data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::hex;
+
+    #[test]
+    fn sha256d_is_a_double_hash() {
+        assert_eq!(
+            hex::encode(&sha256d(b"hello")),
+            "9595c9df90075148eb06860365df33584b75bff782a510c6cd4883a419833d50"
+        );
+    }
 
     #[test]
     fn sha256_known_vectors() {

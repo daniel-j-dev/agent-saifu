@@ -19,7 +19,7 @@ Built from the ground up in Rust. Driven entirely through MCP.
 | ETH Layer 2s (Base, Arbitrum, Optimism and any EVM network you add) | ✅ Fully covered |
 | Sui (mainnet, testnet, devnet; swaps on mainnet via Cetus) | ✅ Fully Covered |
 | Solana (mainnet, devnet, testnet; swaps on mainnet via Jupiter) | ✅ Fully Covered |
-| Bitcoin | 🔜 Soon |
+| Bitcoin (mainnet, testnet4, signet; native SegWit) | ✅ Fully Covered |
 
 <br>
 
@@ -130,7 +130,7 @@ See [**spec.md**](spec.md) for every tool, the full security design, setup instr
 - **Ethereum and layer 2s:** add custom networks per wallet and check balances across all of them, with USDC values.
 - **Sui:** create or import Ed25519 wallets (the same 24-word phrases and `suiprivkey` keys as Slush and the Sui CLI), bound to mainnet, testnet or devnet, built on the official Sui Rust SDK. Send any coin, sign transactions and messages (Wallet Standard equivalents), and swap through the Cetus aggregator.
 - **Solana:** create or import Ed25519 wallets following Phantom (the same 24-word phrases at `m/44'/501'/0'/0'`, and the same base58 private keys), bound to mainnet, devnet or testnet. Send SOL and any SPL or Token-2022 token, sign transactions (decoded and simulated first) and messages, and swap through Jupiter. Solana has no layer 2s to add.
-- **Safe transactions:** estimate fees, simulate before signing, decode approvals, and revoke them when finished.
+- **Bitcoin:** create or import wallets with one native SegWit (`bc1q...`) address at the BIP 84 path `m/84'/0'/0'/0/0` (so the same 24-word phrase gives the same address in Sparrow, Ledger or Trezor), bound to mainnet, testnet4 or signet. Send BTC with Bitcoin Core's wallet rules (replaceable BIP 143 transactions, dust and maximum-fee limits, anti-fee-sniping lock time, signatures verified before use), estimate fees, dry-run payments, sign messages with BIP 322, and read balances, transactions and history through an Esplora API. One address per wallet, no swaps or WalletConnect. estimate fees, simulate before signing, decode approvals, and revoke them when finished.
 - **Token swaps:** quotes and swaps through OpenOcean (Ethereum), Jupiter (Solana, keyless) and Cetus (Sui), with local verification and slippage protection.
 - **WalletConnect v2:** connect to any dapp (Ethereum, Sui or Solana), review the expected outcome of each request, then approve or reject it.
 - **No double payments:** signed transactions are recorded before broadcast, so a lost response is never paid twice.

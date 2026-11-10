@@ -4,6 +4,8 @@
     clippy::too_many_arguments
 )]
 
+pub mod bitcoin;
+pub mod bitcoin_config;
 pub mod blockchain;
 pub mod crypto;
 pub mod eth;
