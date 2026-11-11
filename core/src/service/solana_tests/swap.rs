@@ -3,6 +3,7 @@
 use super::*;
 use crate::solana::swap::SolanaSwapFee;
 use crate::solana::swap::SolanaSwapSettings;
+use crate::solana::swap::{self as ssw};
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BUILD: &str = "/swap/v2/build";
@@ -40,12 +41,65 @@ fn instruction_json(program: &Pubkey, accounts: &[(Pubkey, bool, bool)], data: &
     )
 }
 
-/// What Jupiter's swap instruction looks like for the checks: it touches the wallet (signing)
-/// and the wallet's USDC account.
-fn swap_instruction(extra: &[(Pubkey, bool, bool)]) -> String {
-    let mut accounts = vec![(owner(), true, true), (usdc_account(), false, true)];
+/// Jupiter's swap instruction: a `route_v2` whose terms match `amounts` (sold, quoted out) at 1%
+/// slippage, laid out as the program expects, delivering to the wallet's account for `out_mint`.
+/// `extra` accounts follow the route's own.
+fn route_instruction(
+    in_mint: &str,
+    out_mint: &str,
+    amounts: (u64, u64, u64),
+    fee_bps: u16,
+    extra: &[(Pubkey, bool, bool)],
+) -> String {
+    let (in_mint, out_mint) = (
+        saddr::parse(in_mint).unwrap(),
+        saddr::parse(out_mint).unwrap(),
+    );
+    let account_for =
+        |mint: &Pubkey| saddr::associated_token_address(&owner(), mint, &token_program()).unwrap();
+    let jupiter = saddr::id(ssw::JUPITER_PROGRAM);
+    let mut accounts = vec![
+        (owner(), true, true),
+        (account_for(&in_mint), false, false),
+        (account_for(&out_mint), false, true),
+        (in_mint, false, false),
+        (out_mint, false, false),
+        (token_program(), false, false),
+        (token_program(), false, false),
+        (jupiter, false, false),
+        (key(98), false, false),
+        (jupiter, false, false),
+    ];
     accounts.extend_from_slice(extra);
-    instruction_json(&key(99), &accounts, &[1, 2, 3])
+    instruction_json(
+        &jupiter,
+        &accounts,
+        &route_data(amounts.0, amounts.1, fee_bps, 9),
+    )
+}
+
+/// `route_v2` data at 1% slippage, with a route plan of `plan_bytes` opaque bytes.
+fn route_data(in_amount: u64, quoted_out: u64, fee_bps: u16, plan_bytes: usize) -> Vec<u8> {
+    let mut data = vec![187, 100, 250, 204, 49, 196, 175, 20];
+    data.extend_from_slice(&in_amount.to_le_bytes());
+    data.extend_from_slice(&quoted_out.to_le_bytes());
+    data.extend_from_slice(&100u16.to_le_bytes());
+    data.extend_from_slice(&fee_bps.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend(std::iter::repeat_n(1u8, plan_bytes));
+    data
+}
+
+/// SOL -> USDC with the default amounts and extra accounts on the swap instruction.
+fn sol_to_usdc_with(extra: &[(Pubkey, bool, bool)]) -> String {
+    let amounts = (100_000_000, 14_000_000, 13_860_000);
+    body_with(
+        SOL_MINT,
+        USDC,
+        amounts,
+        &route_instruction(SOL_MINT, USDC, amounts, 0, extra),
+        "{}",
+    )
 }
 
 fn body_with(
@@ -65,7 +119,13 @@ fn body_with(
 }
 
 fn plain_body(in_mint: &str, out_mint: &str, amounts: (u64, u64, u64)) -> String {
-    body_with(in_mint, out_mint, amounts, &swap_instruction(&[]), "{}")
+    body_with(
+        in_mint,
+        out_mint,
+        amounts,
+        &route_instruction(in_mint, out_mint, amounts, 0, &[]),
+        "{}",
+    )
 }
 
 /// SOL -> USDC: sells 0.1 SOL, quoted 14 USDC, at least 13.86.
@@ -124,11 +184,13 @@ fn fee_fx(body: String, existing_fee_account: bool) -> Fx {
 }
 
 fn fee_body() -> String {
+    // 13.9 USDC after the 0.7% fee; the program enforces 1% less, 13.761
+    let amounts = (100_000_000, 13_900_000, 13_761_000);
     body_with(
         SOL_MINT,
         USDC,
-        (100_000_000, 13_900_000, 13_760_000),
-        &swap_instruction(&[(fee_account(), false, true)]),
+        amounts,
+        &route_instruction(SOL_MINT, USDC, amounts, 70, &[(fee_account(), false, true)]),
         "{}",
     )
 }
@@ -231,7 +293,7 @@ fn swapping_assembles_signs_and_submits_the_checked_transaction() {
         [
             saddr::id(saddr::COMPUTE_BUDGET_PROGRAM),
             saddr::id(saddr::COMPUTE_BUDGET_PROGRAM),
-            key(99)
+            saddr::id(ssw::JUPITER_PROGRAM)
         ]
     );
     let (limit, price) = tx::compute_budget(&sent.message, &sent.message.account_keys);
@@ -277,6 +339,39 @@ fn the_priority_fee_is_capped_and_defaults_to_the_networks() {
     let sent = submitted(&f);
     let (_, price) = tx::compute_budget(&sent.message, &sent.message.account_keys);
     assert_eq!(price, Some(1_000));
+}
+
+#[test]
+fn an_explicit_priority_fee_replaces_the_one_from_jupiter_or_the_network() {
+    let f = swap_fx(sol_to_usdc());
+    let p = SwapParams {
+        priority_fee: Some("0.0002".to_string()),
+        ..params()
+    };
+    swap_of(&f, &p).unwrap();
+    let sent = submitted(&f);
+    assert_eq!(
+        tx::priority_fee_lamports(&sent.message, &sent.message.account_keys),
+        200_000
+    );
+
+    let f = swap_fx(sol_to_usdc());
+    let none = SwapParams {
+        priority_fee: Some("0".to_string()),
+        ..params()
+    };
+    swap_of(&f, &none).unwrap();
+    let sent = submitted(&f);
+    let (_, price) = tx::compute_budget(&sent.message, &sent.message.account_keys);
+    assert_eq!(price, None);
+
+    let f = swap_fx(sol_to_usdc());
+    let bad = SwapParams {
+        priority_fee: Some("5".to_string()),
+        ..params()
+    };
+    assert!(swap_of(&f, &bad).unwrap_err().contains("0.01 SOL"));
+    assert_eq!(f.mock.count("sendTransaction"), 0);
 }
 
 #[test]
@@ -352,13 +447,7 @@ fn a_swap_that_would_overspend_or_underdeliver_is_never_signed() {
             .post
             .insert(key(61), token_acct(&key(70), &owner(), 0));
     }
-    let body = body_with(
-        SOL_MINT,
-        USDC,
-        (100_000_000, 14_000_000, 13_860_000),
-        &swap_instruction(&[(key(61), false, true)]),
-        "{}",
-    );
+    let body = sol_to_usdc_with(&[(key(61), false, true)]);
     let f = swap_fx_in(w, body, |s| s);
     refused_with(&f, "did not ask to sell");
 }
@@ -385,17 +474,11 @@ fn simulation_warnings_and_failures_stop_the_swap() {
 #[test]
 fn instructions_that_need_other_signers_or_grant_rights_are_refused() {
     // a second signer who cannot sign
-    let two_signers = body_with(
-        SOL_MINT,
-        USDC,
-        (100_000_000, 14_000_000, 13_860_000),
-        &swap_instruction(&[(key(8), true, false)]),
-        "{}",
-    );
+    let two_signers = sol_to_usdc_with(&[(key(8), true, false)]);
     let f = swap_fx(two_signers);
     refused_with(&f, "someone other than this wallet");
 
-    // an unlimited approval over the wallet's USDC account
+    // an unlimited approval over the wallet's USDC account, alongside the swap
     let mut data = vec![4u8];
     data.extend_from_slice(&u64::MAX.to_le_bytes());
     let approve = instruction_json(
@@ -407,6 +490,14 @@ fn instructions_that_need_other_signers_or_grant_rights_are_refused() {
         ],
         &data,
     );
+    let body = sol_to_usdc().replace(
+        r#""otherInstructions":[]"#,
+        &format!(r#""otherInstructions":[{approve}]"#),
+    );
+    let f = swap_fx(body);
+    refused_with(&f, "unsafe");
+
+    // a swap instruction that is not Jupiter's verifiable route
     let body = body_with(
         SOL_MINT,
         USDC,
@@ -415,7 +506,7 @@ fn instructions_that_need_other_signers_or_grant_rights_are_refused() {
         "{}",
     );
     let f = swap_fx(body);
-    refused_with(&f, "unsafe");
+    refused_with(&f, "other than Jupiter's aggregator");
 
     // a blockhash the cluster does not accept
     let f = swap_fx(sol_to_usdc());
@@ -468,6 +559,31 @@ fn min_receive_is_a_floor_on_the_guaranteed_minimum() {
     assert!(f.world.borrow().sent.is_empty());
     p.min_receive = Some("13.86".to_string());
     assert!(swap_of(&f, &p).is_ok());
+}
+
+#[test]
+fn min_receive_binds_the_minimum_the_program_enforces() {
+    // Jupiter reports a 13.86 USDC minimum, but its instruction is quoted at 13.95, so the
+    // program would accept as little as 13.8105 once the transaction lands.
+    let body = body_with(
+        SOL_MINT,
+        USDC,
+        (100_000_000, 14_000_000, 13_860_000),
+        &route_instruction(SOL_MINT, USDC, (100_000_000, 13_950_000, 0), 0, &[]),
+        "{}",
+    );
+    let f = swap_fx(body.clone());
+    let v = quote_of(&f, &params()).unwrap();
+    assert_eq!(text(&v, &["to", "minimum_amount"]), "13.8105");
+    let f = swap_fx(body);
+    let mut p = params();
+    p.min_receive = Some("13.86".to_string());
+    let err = swap_of(&f, &p).unwrap_err();
+    assert!(
+        err.contains("min_receive") && err.contains("13810500"),
+        "{err}"
+    );
+    assert!(f.world.borrow().sent.is_empty());
 }
 
 #[test]
@@ -539,15 +655,10 @@ fn swap_parameters_are_validated() {
 }
 
 fn oversized_body() -> String {
-    let mut accounts = vec![(owner(), true, true), (usdc_account(), false, true)];
-    accounts.push((key(31), false, false));
-    let swap = instruction_json(&key(99), &accounts, &vec![1u8; 1_300]);
-    body_with(
-        SOL_MINT,
-        USDC,
-        (100_000_000, 14_000_000, 13_860_000),
-        &swap,
-        "{}",
+    let amounts = (100_000_000, 14_000_000, 13_860_000);
+    sol_to_usdc_with(&[(key(31), false, false)]).replace(
+        &base64::encode(&route_data(amounts.0, amounts.1, 0, 9)),
+        &base64::encode(&route_data(amounts.0, amounts.1, 0, 1_300)),
     )
 }
 
@@ -677,7 +788,7 @@ fn the_fee_is_requested_from_jupiter_and_its_account_is_opened() {
     let programs = programs_of(&sent);
     assert_eq!(programs.len(), 4);
     assert_eq!(programs[2], saddr::id(saddr::ASSOCIATED_TOKEN_PROGRAM));
-    assert_eq!(programs[3], key(99));
+    assert_eq!(programs[3], saddr::id(ssw::JUPITER_PROGRAM));
     let created: Vec<_> = ops_of(&sent)
         .into_iter()
         .filter_map(|op| match op {
@@ -719,8 +830,20 @@ fn an_existing_fee_account_is_used_as_it_is() {
 
 #[test]
 fn a_swap_that_would_not_pay_the_fee_is_refused() {
-    // Jupiter's swap instruction does not include the fee account
+    // Jupiter's swap instruction charges no fee
     let f = fee_fx(sol_to_usdc(), false);
+    refused_with(&f, "platform fee of 0 bps, not the configured 70 bps");
+
+    // it charges the fee but does not include the fee account
+    let amounts = (100_000_000, 13_900_000, 13_761_000);
+    let body = body_with(
+        SOL_MINT,
+        USDC,
+        amounts,
+        &route_instruction(SOL_MINT, USDC, amounts, 70, &[]),
+        "{}",
+    );
+    let f = fee_fx(body, false);
     refused_with(&f, "fee would be lost");
 }
 
@@ -744,11 +867,18 @@ fn the_fee_is_paid_in_the_token_bought_even_when_that_is_sol() {
     let wsol = saddr::id(saddr::WRAPPED_SOL_MINT);
     let wsol_fee_account =
         saddr::associated_token_address(&key(5), &wsol, &token_program()).unwrap();
+    let amounts = (14_000_000, 100_000_000, 99_000_000);
     let body = body_with(
         USDC,
         SOL_MINT,
-        (14_000_000, 100_000_000, 99_000_000),
-        &swap_instruction(&[(wsol_fee_account, false, true)]),
+        amounts,
+        &route_instruction(
+            USDC,
+            SOL_MINT,
+            amounts,
+            70,
+            &[(wsol_fee_account, false, true)],
+        ),
         "{}",
     );
     let w = swap_world();
@@ -808,7 +938,13 @@ fn table_body() -> String {
         SOL_MINT,
         USDC,
         (100_000_000, 14_000_000, 13_860_000),
-        &swap_instruction(&[]),
+        &route_instruction(
+            SOL_MINT,
+            USDC,
+            (100_000_000, 14_000_000, 13_860_000),
+            0,
+            &[],
+        ),
         &format!(
             r#"{{"{}":["{}","{}"]}}"#,
             key_text(60),

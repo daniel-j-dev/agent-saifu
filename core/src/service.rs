@@ -98,6 +98,10 @@ pub struct IntentParams {
     pub asset: Option<String>,
     pub amount: Option<String>,
     pub transaction_bytes: Option<String>,
+    /// Solana transfers only: the total priority fee in whole SOL.
+    pub priority_fee: Option<String>,
+    /// Sui transfers only: the gas budget in whole SUI.
+    pub gas_budget: Option<String>,
 }
 
 /// How a Bitcoin payment's fee is chosen: an explicit rate in satoshis per virtual byte, or a
@@ -135,6 +139,10 @@ pub struct SwapParams {
     /// Receive the bought tokens at another address on the same chain.
     pub to_address: Option<String>,
     pub min_receive: Option<String>,
+    /// Solana swaps only: the total priority fee in whole SOL.
+    pub priority_fee: Option<String>,
+    /// Sui swaps only: the gas budget in whole SUI.
+    pub gas_budget: Option<String>,
 }
 
 struct PreparedSwap {

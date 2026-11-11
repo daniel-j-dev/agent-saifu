@@ -3,9 +3,11 @@
 //! Jupiter's keyless `/build` endpoint (`<base>/build`, set in `swap_config.rs`) answers with the
 //! instructions of a swap, not with a transaction. The wallet assembles the transaction itself
 //! (its own blockhash, compute budget and, when a fee is configured, the fee recipient's token
-//! account), and never trusts the result: the transaction is checked structurally and then
-//! simulated, and it is only signed when the simulation shows the wallet spends no more than
-//! requested and receives at least the quoted minimum (see `check_effects`).
+//! account), and never trusts the result: the swap instruction is decoded so the minimum output
+//! the program enforces on-chain is checked against the request (see `RouteTerms`), the
+//! transaction is checked structurally and then simulated, and it is only signed when the
+//! simulation shows the wallet spends no more than requested and receives at least the quoted
+//! minimum (see `check_effects`).
 
 use super::address::{self, Pubkey};
 use super::describe::{self, Op};
@@ -32,6 +34,24 @@ const SLIPPAGE_TOLERANCE_BPS: u32 = 50;
 const MAX_INSTRUCTION_ACCOUNTS: usize = 256;
 const MAX_LOOKUP_TABLES: usize = 16;
 const MAX_TABLE_ADDRESSES: usize = 256;
+
+/// Jupiter's aggregator program (v6), the only program the swap instruction may call.
+pub const JUPITER_PROGRAM: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+/// Anchor discriminators of the exact-input routes `/build` returns. Jupiter's published IDL
+/// gives both `in_amount: u64, quoted_out_amount: u64, slippage_bps: u16, platform_fee_bps: u16,
+/// positive_slippage_bps: u16` at a fixed offset after the discriminator
+/// (`shared_accounts_route_v2` first has an `id: u8`), then the route plan. The older forms put
+/// those terms after a variable-length route plan, so they cannot be read with certainty and are
+/// refused, like any other instruction.
+const ROUTE_V2: [u8; 8] = [187, 100, 250, 204, 49, 196, 175, 20];
+const SHARED_ACCOUNTS_ROUTE_V2: [u8; 8] = [209, 152, 83, 147, 124, 254, 216, 233];
+/// `route_v2`'s `user_destination_token_account`, which receives the output.
+const ROUTE_V2_DESTINATION: usize = 2;
+/// `route_v2`'s optional `destination_token_account`, which would receive the output instead.
+/// When absent, Anchor fills the slot with the program's own address.
+const ROUTE_V2_DESTINATION_OVERRIDE: usize = 7;
+/// `shared_accounts_route_v2`'s `destination_token_account`.
+const SHARED_ACCOUNTS_ROUTE_V2_DESTINATION: usize = 5;
 
 // ---- settings ----------------------------------------------------------------------------------
 
@@ -180,7 +200,11 @@ pub struct Quote {
     pub in_amount: u64,
     /// What the wallet should receive, after any platform fee.
     pub out_amount: u64,
+    /// Jupiter's `otherAmountThreshold`. Only the simulation is held to it; what the program
+    /// enforces on-chain is `terms.enforced_minimum()`.
     pub min_out_amount: u64,
+    /// The terms decoded from the swap instruction itself.
+    pub terms: RouteTerms,
     /// Signed percentage, e.g. `-0.05`.
     pub price_impact: Option<f64>,
     pub route: Vec<String>,
@@ -193,6 +217,89 @@ pub struct Quote {
     pub tables: Vec<LookupTable>,
     /// Jupiter's suggested priority fee, in micro-lamports per compute unit.
     pub compute_price: Option<u64>,
+}
+
+impl Quote {
+    /// The least the swap can deliver once signed: the minimum the program itself enforces.
+    pub fn guaranteed_minimum(&self) -> u64 {
+        self.terms.enforced_minimum()
+    }
+}
+
+/// The terms of Jupiter's swap instruction, as the program will read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteTerms {
+    pub in_amount: u64,
+    /// The output the route was quoted at, after the platform fee (it equals the API's
+    /// `outAmount`, and the API's `otherAmountThreshold` is this less the slippage).
+    pub quoted_out_amount: u64,
+    pub slippage_bps: u16,
+    pub platform_fee_bps: u16,
+    /// Share of any output above the quote that the platform keeps.
+    pub positive_slippage_bps: u16,
+    /// The token account the output is delivered to.
+    pub destination: Pubkey,
+}
+
+impl RouteTerms {
+    /// Reads the terms of a `route_v2` or `shared_accounts_route_v2` call to Jupiter's program.
+    /// Anything else is an error: the wallet only signs a swap whose terms it has understood.
+    pub fn decode(ix: &Instruction) -> Result<RouteTerms, String> {
+        let jupiter = address::id(JUPITER_PROGRAM);
+        if ix.program_id != jupiter {
+            return Err(
+                "refusing: Jupiter's swap instruction calls a program other than Jupiter's aggregator"
+                    .to_string(),
+            );
+        }
+        let unreadable = || {
+            "refusing: Jupiter's swap instruction is not a route this wallet can verify".to_string()
+        };
+        let account = |n: usize| ix.accounts.get(n).map(|a| a.pubkey);
+        let discriminator = ix.data.get(..8).ok_or_else(unreadable)?;
+        let (args, destination) = if discriminator == ROUTE_V2 {
+            if account(ROUTE_V2_DESTINATION_OVERRIDE) != Some(jupiter) {
+                return Err(
+                    "refusing: Jupiter's swap instruction delivers the output to an account other than the wallet's"
+                        .to_string(),
+                );
+            }
+            (ix.data.get(8..), account(ROUTE_V2_DESTINATION))
+        } else if discriminator == SHARED_ACCOUNTS_ROUTE_V2 {
+            (
+                ix.data.get(9..),
+                account(SHARED_ACCOUNTS_ROUTE_V2_DESTINATION),
+            )
+        } else {
+            return Err(unreadable());
+        };
+        let args = args.ok_or_else(unreadable)?;
+        let u64_at = |at: usize| {
+            args.get(at..at + 8)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_le_bytes)
+        };
+        let u16_at = |at: usize| {
+            args.get(at..at + 2)
+                .and_then(|b| b.try_into().ok())
+                .map(u16::from_le_bytes)
+        };
+        Ok(RouteTerms {
+            in_amount: u64_at(0).ok_or_else(unreadable)?,
+            quoted_out_amount: u64_at(8).ok_or_else(unreadable)?,
+            slippage_bps: u16_at(16).ok_or_else(unreadable)?,
+            platform_fee_bps: u16_at(18).ok_or_else(unreadable)?,
+            positive_slippage_bps: u16_at(20).ok_or_else(unreadable)?,
+            destination: destination.ok_or_else(unreadable)?,
+        })
+    }
+
+    /// The quoted output less the slippage, rounded down: the least the program can let the swap
+    /// deliver from these terms, whichever way it rounds.
+    pub fn enforced_minimum(&self) -> u64 {
+        let kept = 10_000u128.saturating_sub(u128::from(self.slippage_bps));
+        u64::try_from(u128::from(self.quoted_out_amount) * kept / 10_000).unwrap_or(u64::MAX)
+    }
 }
 
 fn present(v: Option<&Value>) -> Option<&Value> {
@@ -340,14 +447,28 @@ pub fn parse_build(body: &str) -> Result<Quote, String> {
     let swap = present(v.get("swapInstruction"))
         .ok_or("Jupiter did not return a swap instruction for this swap")?;
     let swap_instruction = parse_instruction(swap, "swap instruction")?;
+    let terms = RouteTerms::decode(&swap_instruction)?;
     let budget = address::id(address::COMPUTE_BUDGET_PROGRAM);
+    let jupiter = address::id(JUPITER_PROGRAM);
     let mut instructions = parse_list(&v, "setupInstructions")?;
     let swap_accounts = swap_instruction.accounts.iter().map(|a| a.pubkey).collect();
     instructions.push(swap_instruction);
+    let swap_index = instructions.len() - 1;
     if let Some(cleanup) = present(v.get("cleanupInstruction")) {
         instructions.push(parse_instruction(cleanup, "cleanup instruction")?);
     }
     instructions.extend(parse_list(&v, "otherInstructions")?);
+    // Only the decoded swap may call Jupiter's program; a second route would go unchecked.
+    if instructions
+        .iter()
+        .enumerate()
+        .any(|(i, ix)| i != swap_index && ix.program_id == jupiter)
+    {
+        return Err(
+            "refusing: Jupiter's response calls its aggregator more than once; only one swap can be verified"
+                .to_string(),
+        );
+    }
     instructions.retain(|i| i.program_id != budget);
     Ok(Quote {
         in_token: pubkey(v.get("inputMint"), "input token")?,
@@ -355,6 +476,7 @@ pub fn parse_build(body: &str) -> Result<Quote, String> {
         in_amount: need("inAmount")?,
         out_amount: need("outAmount")?,
         min_out_amount: need("otherAmountThreshold")?,
+        terms,
         // Jupiter reports the impact as a fraction (-0.01 is -1%).
         price_impact: float(v.get("priceImpactPct")).map(|f| f * 100.0),
         route: route_names(&v),
@@ -380,16 +502,56 @@ pub struct Expectation {
     pub min_receive: Option<u64>,
     /// The token account that must collect the fee, when one is configured.
     pub fee_account: Option<Pubkey>,
+    /// The configured platform fee in basis points (zero without a fee).
+    pub fee_bps: u32,
 }
 
 fn check_slippage(q: &Quote, e: &Expectation) -> Result<(), String> {
     let allowed = u128::from(e.slippage_bps + SLIPPAGE_TOLERANCE_BPS);
     let floor = u128::from(q.out_amount) * 10_000u128.saturating_sub(allowed) / 10_000;
-    if u128::from(q.min_out_amount) < floor {
+    let guaranteed = q.guaranteed_minimum();
+    if u128::from(q.min_out_amount) < floor || u128::from(guaranteed) < floor {
         return Err(format!(
             "refusing: the quote guarantees only {} base units, which is looser than the requested slippage allows",
-            q.min_out_amount
+            q.min_out_amount.min(guaranteed)
         ));
+    }
+    Ok(())
+}
+
+/// Checks the decoded swap instruction against the quote and the request: it sells the quoted
+/// amount, delivers to the wallet's own token account for the bought token, charges exactly the
+/// configured platform fee, and keeps none of a better-than-quoted price.
+fn check_terms(q: &Quote, e: &Expectation) -> Result<(), String> {
+    let t = &q.terms;
+    if t.in_amount != q.in_amount {
+        return Err(
+            "refusing: Jupiter's swap instruction sells a different amount than quoted".to_string(),
+        );
+    }
+    let own_accounts = [address::TOKEN_PROGRAM, address::TOKEN_2022_PROGRAM]
+        .iter()
+        .filter_map(|p| {
+            address::associated_token_address(&e.owner, &e.out_token, &address::id(p)).ok()
+        })
+        .collect::<Vec<_>>();
+    if !own_accounts.contains(&t.destination) {
+        return Err(
+            "refusing: Jupiter's swap instruction delivers the output to an account other than the wallet's"
+                .to_string(),
+        );
+    }
+    if u32::from(t.platform_fee_bps) != e.fee_bps {
+        return Err(format!(
+            "refusing: Jupiter's swap instruction charges a platform fee of {} bps, not the configured {} bps",
+            t.platform_fee_bps, e.fee_bps
+        ));
+    }
+    if t.positive_slippage_bps != 0 {
+        return Err(
+            "refusing: Jupiter's swap instruction would keep part of any better-than-quoted price"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -414,13 +576,16 @@ pub fn check_quote(q: &Quote, e: &Expectation) -> Result<(), String> {
     if q.min_out_amount > q.out_amount {
         return Err("the quote's minimum exceeds its expected amount; refusing".to_string());
     }
+    check_terms(q, e)?;
     check_slippage(q, e)?;
+    // The floor is checked against what the program enforces, so it still holds if the price
+    // moves between the simulation and the transaction landing.
     if let Some(floor) = e.min_receive
-        && q.min_out_amount < floor
+        && q.guaranteed_minimum() < floor
     {
         return Err(format!(
             "the guaranteed minimum ({}) is below your min_receive ({floor}); not swapping. Fetch a new quote or lower min_receive",
-            q.min_out_amount
+            q.guaranteed_minimum()
         ));
     }
     if let Some(impact) = q.price_impact
@@ -503,7 +668,10 @@ pub fn check_effects(
     }
     let wsol = address::id(address::WRAPPED_SOL_MINT);
     let native_change = effects.sol_change + effects.token_change(&wsol);
-    let (spent_floor, received_floor) = (i128::from(e.requested), i128::from(q.min_out_amount));
+    let (spent_floor, received_floor) = (
+        i128::from(e.requested),
+        i128::from(q.min_out_amount.max(q.guaranteed_minimum())),
+    );
     let allowance = i128::from(allowance);
     // The leg in SOL counts the wrapped SOL account too, since swaps pass through it.
     if e.in_native {
@@ -560,6 +728,54 @@ mod tests {
         Transaction::unsigned(compile_legacy(payer, &[ix], [0u8; 32]).unwrap())
     }
 
+    fn usdc_account() -> Pubkey {
+        address::associated_token_address(
+            &owner(),
+            &address::id(USDC),
+            &address::id(address::TOKEN_PROGRAM),
+        )
+        .unwrap()
+    }
+
+    /// `route_v2` data: the discriminator, the terms, then a route plan (opaque here).
+    fn route_data(in_amount: u64, quoted_out: u64, slippage_bps: u16, fee_bps: u16) -> Vec<u8> {
+        let mut data = ROUTE_V2.to_vec();
+        data.extend_from_slice(&in_amount.to_le_bytes());
+        data.extend_from_slice(&quoted_out.to_le_bytes());
+        data.extend_from_slice(&slippage_bps.to_le_bytes());
+        data.extend_from_slice(&fee_bps.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&[1, 0, 0, 0, 7, 0x10, 0x27, 0, 1]);
+        data
+    }
+
+    /// `route_v2`'s accounts: authority, source, destination, the two mints, the two token
+    /// programs, the (absent) destination override, the event authority and the program.
+    fn route_metas(destination: Pubkey) -> Vec<AccountMeta> {
+        let jupiter = address::id(JUPITER_PROGRAM);
+        let token = address::id(address::TOKEN_PROGRAM);
+        vec![
+            AccountMeta::readonly(owner(), true),
+            AccountMeta::writable(key(40), false),
+            AccountMeta::writable(destination, false),
+            AccountMeta::readonly(address::id(address::WRAPPED_SOL_MINT), false),
+            AccountMeta::readonly(address::id(USDC), false),
+            AccountMeta::readonly(token, false),
+            AccountMeta::readonly(token, false),
+            AccountMeta::readonly(jupiter, false),
+            AccountMeta::readonly(key(41), false),
+            AccountMeta::readonly(jupiter, false),
+        ]
+    }
+
+    fn route_ix(data: Vec<u8>) -> Instruction {
+        Instruction {
+            program_id: address::id(JUPITER_PROGRAM),
+            accounts: route_metas(usdc_account()),
+            data,
+        }
+    }
+
     fn quote() -> Quote {
         Quote {
             in_token: address::id(address::WRAPPED_SOL_MINT),
@@ -567,6 +783,14 @@ mod tests {
             in_amount: 100_000_000,
             out_amount: 14_000_000,
             min_out_amount: 13_860_000,
+            terms: RouteTerms {
+                in_amount: 100_000_000,
+                quoted_out_amount: 14_000_000,
+                slippage_bps: 100,
+                platform_fee_bps: 0,
+                positive_slippage_bps: 0,
+                destination: usdc_account(),
+            },
             price_impact: Some(-0.12),
             route: vec!["Raydium".to_string()],
             instructions: vec![],
@@ -574,6 +798,19 @@ mod tests {
             tables: vec![],
             compute_price: None,
         }
+    }
+
+    /// The quote with its instruction's terms matching its amounts and bought token.
+    fn consistent(mut q: Quote) -> Quote {
+        q.terms.in_amount = q.in_amount;
+        q.terms.quoted_out_amount = q.out_amount;
+        q.terms.destination = address::associated_token_address(
+            &owner(),
+            &q.out_token,
+            &address::id(address::TOKEN_PROGRAM),
+        )
+        .unwrap();
+        q
     }
 
     fn expectation() -> Expectation {
@@ -587,6 +824,7 @@ mod tests {
             slippage_bps: 100,
             min_receive: None,
             fee_account: None,
+            fee_bps: 0,
         }
     }
 
@@ -615,15 +853,13 @@ mod tests {
             &[account_json(&owner(), true, true)],
             &[1],
         );
-        let swap = instruction_json(
-            &key(30),
-            &[
-                account_json(&owner(), true, false),
-                account_json(&key(40), false, true),
-                account_json(&key(41), false, false),
-            ],
-            &[9, 9],
-        );
+        let swap_ix = route_ix(route_data(100_000_000, 14_000_000, 100, 0));
+        let swap_accounts: Vec<String> = swap_ix
+            .accounts
+            .iter()
+            .map(|m| account_json(&m.pubkey, m.is_signer, m.is_writable))
+            .collect();
+        let swap = instruction_json(&swap_ix.program_id, &swap_accounts, &swap_ix.data);
         let cleanup = instruction_json(
             &address::id(address::TOKEN_PROGRAM),
             &[account_json(&key(42), false, true)],
@@ -724,14 +960,131 @@ mod tests {
         assert_eq!(q.compute_price, Some(7_000));
         // setup, swap, cleanup; the compute budget is left out
         assert_eq!(q.instructions.len(), 3);
-        assert_eq!(q.instructions[1].program_id, key(30));
-        assert_eq!(q.instructions[1].data, [9, 9]);
+        assert_eq!(q.instructions[1].program_id, address::id(JUPITER_PROGRAM));
+        assert_eq!(
+            q.instructions[1].data,
+            route_data(100_000_000, 14_000_000, 100, 0)
+        );
         assert_eq!(
             q.instructions[1].accounts[0],
             AccountMeta::readonly(owner(), true)
         );
-        assert_eq!(q.swap_accounts, [owner(), key(40), key(41)]);
+        let metas: Vec<Pubkey> = route_metas(usdc_account())
+            .iter()
+            .map(|m| m.pubkey)
+            .collect();
+        assert_eq!(q.swap_accounts, metas);
+        assert_eq!(q.terms, quote().terms);
+        assert_eq!(q.guaranteed_minimum(), 13_860_000);
         assert_eq!(q.tables, [(key(60), vec![key(40), key(41)])]);
+    }
+
+    #[test]
+    fn decodes_a_recorded_jupiter_route() {
+        // A live `/swap/v2/build` answer: 0.1 SOL to USDC at 1% slippage, without and with a
+        // 0.7% platform fee. Its `otherAmountThreshold` was 8226554 and 8168343, the quoted
+        // output less 1% rounded up; the program's own minimum is taken rounded down.
+        let accounts = |n: usize| -> Vec<AccountMeta> {
+            let mut metas = route_metas(key(2));
+            metas.truncate(n);
+            metas
+        };
+        for (data, out, fee, minimum) in [
+            (
+                "u2T6zDHErxQA4fUFAAAAAJLLfgAAAAAAZAAAAAAAAQAAAJcAECcAAQ==",
+                8_309_650,
+                0,
+                8_226_553,
+            ),
+            (
+                "u2T6zDHErxQA4fUFAAAAAOPlfQAAAAAAZABGAAAAAQAAALEBECcAAQ==",
+                8_250_851,
+                70,
+                8_168_342,
+            ),
+        ] {
+            let ix = Instruction {
+                program_id: address::id(JUPITER_PROGRAM),
+                accounts: accounts(10),
+                data: base64::decode(data).unwrap(),
+            };
+            let terms = RouteTerms::decode(&ix).unwrap();
+            assert_eq!(
+                terms,
+                RouteTerms {
+                    in_amount: 100_000_000,
+                    quoted_out_amount: out,
+                    slippage_bps: 100,
+                    platform_fee_bps: fee,
+                    positive_slippage_bps: 0,
+                    destination: key(2),
+                }
+            );
+            assert_eq!(terms.enforced_minimum(), minimum);
+        }
+    }
+
+    #[test]
+    fn decodes_shared_accounts_routes() {
+        let mut data = SHARED_ACCOUNTS_ROUTE_V2.to_vec();
+        data.push(3);
+        data.extend_from_slice(&route_data(5, 1_000, 50, 70)[8..]);
+        let mut accounts = route_metas(key(2));
+        accounts[SHARED_ACCOUNTS_ROUTE_V2_DESTINATION] = AccountMeta::writable(key(9), false);
+        let ix = Instruction {
+            program_id: address::id(JUPITER_PROGRAM),
+            accounts,
+            data,
+        };
+        let terms = RouteTerms::decode(&ix).unwrap();
+        assert_eq!((terms.in_amount, terms.quoted_out_amount), (5, 1_000));
+        assert_eq!((terms.slippage_bps, terms.platform_fee_bps), (50, 70));
+        assert_eq!(terms.destination, key(9));
+        assert_eq!(terms.enforced_minimum(), 995);
+    }
+
+    #[test]
+    fn unverifiable_swap_instructions_are_refused() {
+        let good = route_ix(route_data(100_000_000, 14_000_000, 100, 0));
+        assert!(RouteTerms::decode(&good).is_ok());
+        let mut other_program = good.clone();
+        other_program.program_id = key(30);
+        // the older `route`, whose terms follow a variable-length route plan
+        let mut v1 = good.clone();
+        v1.data[..8].copy_from_slice(&[229, 23, 203, 151, 122, 227, 173, 42]);
+        let mut short = good.clone();
+        short.data.truncate(8 + 21);
+        let mut redirected = good.clone();
+        redirected.accounts[ROUTE_V2_DESTINATION_OVERRIDE] = AccountMeta::writable(key(9), false);
+        let mut few_accounts = good.clone();
+        few_accounts
+            .accounts
+            .truncate(ROUTE_V2_DESTINATION_OVERRIDE);
+        for (name, ix) in [
+            ("other program", other_program),
+            ("route v1", v1),
+            ("short data", short),
+            ("destination override", redirected),
+            ("missing accounts", few_accounts),
+        ] {
+            let err = RouteTerms::decode(&ix).unwrap_err();
+            assert!(err.starts_with("refusing"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_second_jupiter_instruction_is_refused() {
+        let extra = instruction_json(
+            &address::id(JUPITER_PROGRAM),
+            &[account_json(&owner(), true, false)],
+            &route_data(1, 1, 100, 0),
+        );
+        let body = build_body().replace(
+            r#""otherInstructions":[]"#,
+            &format!(r#""otherInstructions":[{extra}]"#),
+        );
+        let err = parse_build(&body).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
     }
 
     #[test]
@@ -768,7 +1121,11 @@ mod tests {
         ] {
             assert!(parse_build(&good.replacen(from, to, 1)).is_err(), "{from}");
         }
-        let junk = good.replacen(&base64::encode(&[9, 9]), "***", 1);
+        let junk = good.replacen(
+            &base64::encode(&route_data(100_000_000, 14_000_000, 100, 0)),
+            "***",
+            1,
+        );
         assert!(parse_build(&junk).unwrap_err().contains("unreadable"));
         let bad_table = good.replacen(&address::to_text(&key(60)), "nope", 1);
         assert!(parse_build(&bad_table).is_err());
@@ -808,6 +1165,30 @@ mod tests {
                 Box::new(|q| q.min_out_amount = q.out_amount / 2),
             ),
             ("impact", Box::new(|q| q.price_impact = Some(-5.1))),
+            (
+                "instruction sells another amount",
+                Box::new(|q| q.terms.in_amount = 99_000_000),
+            ),
+            (
+                "instruction delivers elsewhere",
+                Box::new(|q| q.terms.destination = key(9)),
+            ),
+            (
+                "instruction charges a fee",
+                Box::new(|q| q.terms.platform_fee_bps = 70),
+            ),
+            (
+                "instruction keeps positive slippage",
+                Box::new(|q| q.terms.positive_slippage_bps = 50),
+            ),
+            (
+                "instruction enforces a looser slippage",
+                Box::new(|q| q.terms.slippage_bps = 1_000),
+            ),
+            (
+                "instruction quotes less",
+                Box::new(|q| q.terms.quoted_out_amount = 7_000_000),
+            ),
         ];
         for (name, change) in cases {
             let mut q = quote();
@@ -823,13 +1204,63 @@ mod tests {
         );
         floor.min_receive = Some(13_860_000);
         assert!(check_quote(&quote(), &floor).is_ok());
+        // Jupiter's reported minimum meets min_receive, but the instruction would let the
+        // program accept less: min_receive is held to what is enforced on-chain.
+        let mut looser = quote();
+        looser.terms.slippage_bps = 150;
+        assert!(check_quote(&looser, &expectation()).is_ok());
+        let err = check_quote(&looser, &floor).unwrap_err();
+        assert!(
+            err.contains("min_receive") && err.contains("13790000"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_configured_fee_must_be_the_one_charged() {
+        let mut e = expectation();
+        e.fee_account = Some(key(41));
+        e.fee_bps = 70;
+        let mut q = quote();
+        assert!(
+            check_quote(&q, &e)
+                .unwrap_err()
+                .contains("platform fee of 0 bps")
+        );
+        q.terms.platform_fee_bps = 70;
+        assert!(check_quote(&q, &e).is_ok());
+        q.terms.platform_fee_bps = 71;
+        assert!(check_quote(&q, &e).is_err());
+    }
+
+    #[test]
+    fn sol_is_delivered_to_the_wallets_wrapped_sol_account() {
+        let wsol = address::id(address::WRAPPED_SOL_MINT);
+        let token = address::id(address::TOKEN_PROGRAM);
+        let mut e = expectation();
+        (e.in_token, e.in_native, e.out_token, e.out_native) =
+            (address::id(USDC), false, wsol, true);
+        let mut q = quote();
+        (q.in_token, q.out_token) = (e.in_token, e.out_token);
+        q.terms.destination = address::associated_token_address(&owner(), &wsol, &token).unwrap();
+        assert!(check_quote(&q, &e).is_ok());
+        q.terms.destination = address::associated_token_address(&key(9), &wsol, &token).unwrap();
+        assert!(
+            check_quote(&q, &e)
+                .unwrap_err()
+                .contains("other than the wallet's")
+        );
+        // Token-2022 accounts of the wallet are its own too
+        let t22 = address::id(address::TOKEN_2022_PROGRAM);
+        q.terms.destination = address::associated_token_address(&owner(), &wsol, &t22).unwrap();
+        assert!(check_quote(&q, &e).is_ok());
     }
 
     #[test]
     fn selling_less_than_requested_is_accepted() {
         let mut q = quote();
         q.in_amount = 99_000_000;
-        assert!(check_quote(&q, &expectation()).is_ok());
+        assert!(check_quote(&consistent(q), &expectation()).is_ok());
     }
 
     #[test]
@@ -995,6 +1426,7 @@ mod tests {
         q.in_amount = 14_000_000;
         q.out_amount = 100_000_000;
         q.min_out_amount = 99_000_000;
+        let q = consistent(q);
         assert!(check_quote(&q, &e).is_ok());
         // SOL arrives (net of fee) and USDC leaves
         let good = effects(99_995_000, &[(usdc, -14_000_000)]);
@@ -1023,6 +1455,7 @@ mod tests {
         q.in_amount = 1_000_000;
         q.out_amount = 5_000_000;
         q.min_out_amount = 4_950_000;
+        let q = consistent(q);
         assert!(check_quote(&q, &e).is_ok());
         let good = effects(-5_000, &[(usdc, -1_000_000), (other, 5_000_000)]);
         assert!(check_effects(&good, &q, &e, 10_000).is_ok());

@@ -819,6 +819,93 @@ fn sending_sol_simulates_signs_and_submits() {
 }
 
 #[test]
+fn an_explicit_priority_fee_is_the_total_the_wallet_pays_on_top() {
+    let f = funded();
+    pay(&f, 1_000_000_000, 105_000);
+    let v = f
+        .service
+        .solana_send_asset_with_priority("w", PW, "native", &key_text(2), "1", Some("0.0001"))
+        .unwrap();
+    let t = submitted(&f);
+    assert_signed_by_wallet(&t);
+    let ops = ops_of(&t);
+    assert_eq!(ops.len(), 3);
+    assert_eq!(ops[0], Op::ComputeLimit(1_480));
+    // 100,000 lamports spread over 1,480 units, rounded down
+    assert_eq!(ops[1], Op::ComputePrice(67_567_567));
+    assert_eq!(
+        tx::priority_fee_lamports(&t.message, &t.message.account_keys),
+        100_000
+    );
+    assert_eq!(text(&v, &["priority_fee_sol"]), "0.0001");
+    assert_eq!(text(&v, &["network_fee_sol"]), "0.000105");
+    assert_eq!(text(&v, &["status"]), "confirmed");
+}
+
+#[test]
+fn a_priority_fee_of_zero_sends_without_one() {
+    let f = funded();
+    pay(&f, 1_000_000_000, 5_000);
+    let v = f
+        .service
+        .solana_send_asset_with_priority("w", PW, "native", &key_text(2), "1", Some("0"))
+        .unwrap();
+    let t = submitted(&f);
+    let ops = ops_of(&t);
+    assert_eq!(ops.len(), 2);
+    assert!(matches!(ops[0], Op::ComputeLimit(_)));
+    assert_eq!(text(&v, &["priority_fee_sol"]), "0");
+    assert_eq!(text(&v, &["network_fee_sol"]), "0.000005");
+}
+
+#[test]
+fn the_default_priority_fee_follows_the_network() {
+    let f = funded();
+    pay(&f, 1_000_000_000, 5_002);
+    let v = f
+        .service
+        .solana_send_asset("w", PW, "native", &key_text(2), "1")
+        .unwrap();
+    assert_eq!(text(&v, &["priority_fee_sol"]), "0.000000002");
+}
+
+#[test]
+fn a_bad_priority_fee_stops_everything_before_the_network_is_used() {
+    let f = funded();
+    for (fee, expect) in [
+        ("1", "0.01 SOL"),
+        ("0.010000001", "0.01 SOL"),
+        ("-0.1", "'priority_fee'"),
+        ("fast", "'priority_fee'"),
+        ("", "'priority_fee'"),
+    ] {
+        let err = f
+            .service
+            .solana_send_asset_with_priority("w", PW, "native", &key_text(2), "1", Some(fee))
+            .unwrap_err();
+        assert!(err.contains(expect), "{fee}: {err}");
+    }
+    assert_eq!(f.mock.count("sendTransaction"), 0);
+    assert_eq!(f.mock.count("simulateTransaction"), 0);
+}
+
+#[test]
+fn a_priority_fee_the_wallet_cannot_afford_is_refused() {
+    let w = world();
+    w.borrow_mut()
+        .accounts
+        .insert(owner(), system_account(1_000_000_000 + 5_000 + 99_999));
+    let f = build(w);
+    import(&f);
+    let err = f
+        .service
+        .solana_send_asset_with_priority("w", PW, "native", &key_text(2), "1", Some("0.0001"))
+        .unwrap_err();
+    assert!(err.contains("insufficient SOL"), "{err}");
+    assert_eq!(f.mock.count("sendTransaction"), 0);
+}
+
+#[test]
 fn sending_validates_before_touching_the_wallet_or_network_state() {
     let f = funded();
     for (asset, to, amount, expect) in [

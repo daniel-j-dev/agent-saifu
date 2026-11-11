@@ -304,6 +304,119 @@ fn estimating_a_transfer_gives_the_fee_in_sol_and_usd() {
 }
 
 #[test]
+fn estimating_with_a_priority_fee_includes_it_in_the_fee() {
+    let f = funded();
+    let params = IntentParams {
+        to: Some(key_text(2)),
+        asset: Some("native".to_string()),
+        amount: Some("1".to_string()),
+        priority_fee: Some("0.0001".to_string()),
+        ..IntentParams::default()
+    };
+    let v = f.service.solana_estimate_gas("w", PW, &params).unwrap();
+    assert_eq!(text(&v, &["fee_lamports"]), "105000");
+    assert_eq!(text(&v, &["priority_fee_sol"]), "0.0001");
+    let v = f
+        .service
+        .solana_simulate_transaction("w", PW, &params)
+        .unwrap();
+    assert_eq!(text(&v, &["fee_lamports"]), "105000");
+    assert_eq!(text(&v, &["priority_fee_sol"]), "0.0001");
+    let bad = IntentParams {
+        priority_fee: Some("2".to_string()),
+        ..params.clone()
+    };
+    let err = f.service.solana_estimate_gas("w", PW, &bad).unwrap_err();
+    assert!(err.contains("0.01 SOL"), "{err}");
+    let with_bytes = IntentParams {
+        to: None,
+        asset: None,
+        amount: None,
+        transaction_bytes: Some(b64(&transfer_tx(1))),
+        priority_fee: Some("0.0001".to_string()),
+        ..IntentParams::default()
+    };
+    let err = f
+        .service
+        .solana_simulate_transaction("w", PW, &with_bytes)
+        .unwrap_err();
+    assert!(err.contains("carries its own compute-budget"), "{err}");
+}
+
+#[test]
+fn simulating_a_transfer_uses_the_final_priority_fee_effects() {
+    for (priority_fee, fee) in [(Some("0.0001"), 105_000), (Some("0"), 5_000), (None, 5_002)] {
+        let final_simulation = format!(
+            r#"{{"value":{{"err":null,"unitsConsumed":450,"accounts":[{},{}]}}}}"#,
+            system_account(5_000_000_000 - 1_000_000_000 - fee).json(),
+            system_account(1_000_000_000).json()
+        );
+        let f = build_with(
+            world(),
+            SendMode::Accept,
+            MAINNET_GENESIS,
+            |s| s,
+            |m| m.on("simulateTransaction", &final_simulation),
+        );
+        import(&f);
+        pay(&f, 1_000_000_000, 5_000);
+        let params = IntentParams {
+            to: Some(key_text(2)),
+            asset: Some("native".to_string()),
+            amount: Some("1".to_string()),
+            priority_fee: priority_fee.map(str::to_string),
+            ..IntentParams::default()
+        };
+        let v = f
+            .service
+            .solana_simulate_transaction("w", PW, &params)
+            .unwrap();
+        assert_eq!(
+            text(&v, &["result", "wallet_changes", "sol", "change_lamports"]),
+            format!("-{}", 1_000_000_000 + fee)
+        );
+        assert_eq!(text(&v, &["fee_lamports"]), fee.to_string());
+        assert_eq!(text(&v, &["result", "compute_units"]), "450");
+        assert_eq!(f.mock.count("simulateTransaction"), 2);
+        let params = f.mock.params("simulateTransaction", 1);
+        let transaction =
+            Transaction::from_base64(params.as_array().unwrap()[0].as_str().unwrap()).unwrap();
+        assert_eq!(
+            tx::fee_estimate(&transaction.message, &transaction.message.account_keys),
+            fee
+        );
+        assert_eq!(f.mock.count("sendTransaction"), 0);
+        assert!(f.world.borrow().sent.is_empty());
+    }
+}
+
+#[test]
+fn a_failed_final_transfer_simulation_prevents_signing_and_sending() {
+    let f = build_with(
+        world(),
+        SendMode::Accept,
+        MAINNET_GENESIS,
+        |s| s,
+        |m| {
+            m.on(
+                "simulateTransaction",
+                r#"{"value":{"err":{"InstructionError":[0,"ComputationalBudgetExceeded"]},"accounts":null}}"#,
+            )
+        },
+    );
+    import(&f);
+    let err = f
+        .service
+        .solana_send_asset_with_priority("w", PW, "native", &key_text(2), "1", Some("0.0001"))
+        .unwrap_err();
+    assert!(err.contains("nothing was signed"), "{err}");
+    assert!(err.contains("ComputationalBudgetExceeded"), "{err}");
+    assert_eq!(f.mock.count("simulateTransaction"), 2);
+    assert_eq!(f.mock.count("sendTransaction"), 0);
+    assert!(f.world.borrow().sent.is_empty());
+}
+
+#[test]
 fn estimating_still_works_on_a_wallet_that_cannot_afford_the_transfer() {
     let w = world();
     w.borrow_mut().accounts.clear();
@@ -662,6 +775,16 @@ fn the_tools_drive_a_solana_wallet_end_to_end() {
     );
     assert!(!err, "{}", v.to_json());
     assert_eq!(text(&v, &["status"]), "confirmed");
+    let (err, v) = call(
+        &tb,
+        "send_asset",
+        &format!(
+            r#"{{{creds},"asset":"native","to":"{}","amount":"0.5","priority_fee":"0.00002"}}"#,
+            key_text(2)
+        ),
+    );
+    assert!(!err, "{}", v.to_json());
+    assert_eq!(text(&v, &["priority_fee_sol"]), "0.00002");
     drop(f);
 }
 
@@ -705,6 +828,27 @@ fn chain_ids_and_other_blockchains_options_are_refused_for_solana_wallets() {
                 key_text(2)
             ),
             "gas_limit",
+        ),
+        (
+            "send_asset",
+            format!(
+                r#"{{{creds},"gas_budget":"0.01","asset":"native","to":"{}","amount":"1"}}"#,
+                key_text(2)
+            ),
+            "'gas_budget' is for Sui wallets",
+        ),
+        (
+            "estimate_gas_fee",
+            format!(r#"{{{creds},"gas_budget":"0.01"}}"#),
+            "'gas_budget' is for Sui wallets",
+        ),
+        (
+            "swap_tokens",
+            format!(
+                r#"{{{creds},"from_token":"native","to_token":"{}","amount":"1","gas_budget":"0.01"}}"#,
+                key_text(2)
+            ),
+            "'gas_budget' is for Sui wallets",
         ),
         (
             "sign_contract_transaction",

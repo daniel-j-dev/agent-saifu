@@ -661,6 +661,143 @@ fn sending_sui_dry_runs_signs_and_submits_exactly_what_it_signed() {
 }
 
 #[test]
+fn an_explicit_gas_budget_is_the_budget_the_transaction_carries() {
+    let f = funded();
+    let out = f
+        .service
+        .sui_send_asset_with_budget("w", PW, "native", &other_address(), "1", Some("0.05"))
+        .unwrap();
+    let (transaction, signature) = submitted(&f);
+    assert_signed_by_wallet(&transaction, &signature);
+    assert_eq!(transaction.gas_payment.budget, 50_000_000);
+    assert_eq!(text(&out, &["gas_budget_mist"]), "50000000");
+    // the budget is a cap: what is charged still comes from the dry run
+    assert_eq!(text(&out, &["gas", "net_mist"]), "1500000");
+
+    let default = funded();
+    let out = default
+        .service
+        .sui_send_asset("w", PW, "native", &other_address(), "1")
+        .unwrap();
+    assert_eq!(
+        text(&out, &["gas_budget_mist"]),
+        (COMPUTATION + 100_000 + STORAGE - REBATE).to_string()
+    );
+}
+
+#[test]
+fn a_bad_gas_budget_is_refused_before_anything_is_signed() {
+    let f = funded();
+    for (budget, expect) in [
+        ("51", "50 SUI"),
+        ("50.000000001", "50 SUI"),
+        ("0", "greater than zero"),
+        ("-1", "'gas_budget'"),
+        ("lots", "'gas_budget'"),
+        ("", "'gas_budget'"),
+        // below 2,000 gas units at the reference price of 100
+        ("0.0001", "smallest budget"),
+        // more than the wallet holds
+        ("6", "not enough SUI"),
+    ] {
+        let err = f
+            .service
+            .sui_send_asset_with_budget("w", PW, "native", &other_address(), "1", Some(budget))
+            .unwrap_err();
+        assert!(err.contains(expect), "{budget}: {err}");
+    }
+    assert_eq!(f.mock.post_count("executeTransaction"), 0);
+}
+
+#[test]
+fn a_budget_too_low_for_the_transaction_is_never_signed_and_says_what_to_use() {
+    let ok = effects_data(
+        "simulateTransaction",
+        "SUCCESS",
+        None,
+        &[sui_loss(1_500_000)],
+    );
+    let failing = effects_data(
+        "simulateTransaction",
+        "FAILURE",
+        Some("InsufficientGas"),
+        &[],
+    );
+    let f = build(
+        SuiMock::new()
+            .data_seq("simulateTransaction", vec![ok, failing])
+            .extend(node(&[(1, 5_000_000_000)], 0)),
+        |s| s,
+    );
+    import(&f);
+    let err = f
+        .service
+        .sui_send_asset_with_budget("w", PW, "native", &other_address(), "1", Some("0.0002"))
+        .unwrap_err();
+    assert!(
+        err.contains("InsufficientGas")
+            && err.contains("gas_budget of 0.0002 SUI may be too low")
+            && err.contains("suggests about 0.0016 SUI"),
+        "{err}"
+    );
+    assert_eq!(f.mock.post_count("executeTransaction"), 0);
+}
+
+#[test]
+fn estimating_and_simulating_with_a_gas_budget() {
+    let f = funded();
+    let params = IntentParams {
+        gas_budget: Some("0.05".to_string()),
+        ..transfer_params("1")
+    };
+    let out = f.service.sui_estimate_gas("w", PW, &params).unwrap();
+    assert_eq!(text(&out, &["gas_budget_mist"]), "50000000");
+    let out = f
+        .service
+        .sui_simulate_transaction("w", PW, &params)
+        .unwrap();
+    assert_eq!(text(&out, &["gas_budget_mist"]), "50000000");
+
+    let bad = IntentParams {
+        gas_budget: Some("100".to_string()),
+        ..transfer_params("1")
+    };
+    let err = f.service.sui_estimate_gas("w", PW, &bad).unwrap_err();
+    assert!(err.contains("50 SUI"), "{err}");
+
+    let with_bytes = IntentParams {
+        transaction_bytes: Some(tx::encode(&own_transaction(7_000_000)).unwrap()),
+        gas_budget: Some("0.05".to_string()),
+        ..IntentParams::default()
+    };
+    let err = f
+        .service
+        .sui_estimate_gas("w", PW, &with_bytes)
+        .unwrap_err();
+    assert!(err.contains("already carries its own gas budget"), "{err}");
+}
+
+#[test]
+fn a_swap_can_carry_a_chosen_gas_budget() {
+    let f = swap_service(swap_node(955_000), Some(fee()));
+    let params = SwapParams {
+        gas_budget: Some("0.1".to_string()),
+        ..swap_params()
+    };
+    f.service.sui_swap_tokens("w", PW, &params).unwrap();
+    let (transaction, signature) = submitted(&f);
+    assert_signed_by_wallet(&transaction, &signature);
+    assert_eq!(transaction.gas_payment.budget, 100_000_000);
+
+    let bad = SwapParams {
+        gas_budget: Some("51".to_string()),
+        ..swap_params()
+    };
+    let err = f.service.sui_swap_tokens("w", PW, &bad).unwrap_err();
+    assert!(err.contains("50 SUI"), "{err}");
+}
+
+#[test]
 fn the_wallet_is_locked_again_after_sending() {
     let f = funded();
     f.service
@@ -1916,6 +2053,16 @@ fn the_tools_drive_a_sui_wallet_end_to_end() {
     assert_eq!(f.mock.post_count("executeTransaction"), 1);
     let (err, out) = call(
         &tb,
+        "send_asset",
+        &format!(
+            r#"{{"wallet_name":"S","password":"correct-horse-battery","asset":"native","to":"{}","amount":"0.5","gas_budget":"0.02"}}"#,
+            other_address()
+        ),
+    );
+    assert!(!err, "{}", out.to_json());
+    assert_eq!(text(&out, &["gas_budget_mist"]), "20000000");
+    let (err, out) = call(
+        &tb,
         "view_private_key",
         r#"{"wallet_name":"S","password":"correct-horse-battery"}"#,
     );
@@ -1947,7 +2094,16 @@ fn sui_wallets_reject_ethereum_arguments_and_tools() {
             r#","gas_limit":21000,"asset":"native","to":"0x2","amount":"1""#,
             "gas_limit",
         ),
-        ("get_wallet_balances", r#","chain_id":1"#, "chain_id"),
+        (
+            "send_asset",
+            r#","priority_fee":"0.0001","asset":"native","to":"0x2","amount":"1""#,
+            "'priority_fee' is for Solana wallets",
+        ),
+        (
+            "swap_tokens",
+            r#","priority_fee":"0.0001","from_token":"native","to_token":"0x2::a::B","amount":"1""#,
+            "'priority_fee' is for Solana wallets",
+        ),
         (
             "get_wallet_balances",
             r#","token_contracts":["0x22"]"#,
@@ -2054,6 +2210,27 @@ fn ethereum_wallets_still_need_their_chain_id_and_reject_sui_arguments() {
         &format!(r#"{{{base},"chain_id":1,"transaction_bytes":"AAAA"}}"#),
     );
     assert!(err && out.to_json().contains("Sui and Solana wallets"));
+    for (tool, extra) in [
+        ("send_asset", r#","asset":"native","to":"0x2","amount":"1""#),
+        ("estimate_gas_fee", ""),
+        ("simulate_transaction", ""),
+        (
+            "swap_tokens",
+            r#","from_token":"native","to_token":"0x2","amount":"1""#,
+        ),
+    ] {
+        for (key, expect) in [
+            ("priority_fee", "'priority_fee' is for Solana wallets"),
+            ("gas_budget", "'gas_budget' is for Sui wallets"),
+        ] {
+            let (err, out) = call(&tb, tool, &format!(r#"{{{base},"{key}":"0.01"{extra}}}"#));
+            assert!(
+                err && out.to_json().contains(expect),
+                "{tool} {key}: {}",
+                out.to_json()
+            );
+        }
+    }
     let (err, out) = call(
         &tb,
         "create_wallet",

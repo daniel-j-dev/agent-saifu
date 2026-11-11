@@ -51,7 +51,7 @@ Wherever this file says "ask the user" or "when the user says to approve", an op
 | See wallets | `list_wallets` (no password) |
 | Create or import | `create_wallet` (`blockchain` = `ethereum`, `sui`, `solana` or `bitcoin`, optional Sui, Solana or Bitcoin `network`), `import_wallet` |
 | Address and balances | `get_wallet_address`, `get_wallet_balances` |
-| Send | `send_asset` (`asset` = `native` (the only Bitcoin asset), an ERC-20 address, a Sui coin type like `0x2::sui::SUI`, or a Solana token mint address; Bitcoin also takes optional `fee_rate` or `confirmation_target`) |
+| Send | `send_asset` (`asset` = `native` (the only Bitcoin asset), an ERC-20 address, a Sui coin type like `0x2::sui::SUI`, or a Solana token mint address; Bitcoin also takes optional `fee_rate` or `confirmation_target`; Solana optional `priority_fee`; Sui optional `gas_budget`) |
 | Swap | `get_swap_quote`, then `swap_tokens` (OpenOcean on Ethereum, Jupiter on Solana mainnet, Cetus on Sui mainnet) |
 | Sign | `sign_contract_transaction`, `sign_personal_message` |
 | History and status | `get_transaction`, `get_transaction_history` |
@@ -64,6 +64,7 @@ Notes that save time:
 - Swaps are same-chain only. `min_receive` is a safety floor; on Sui pairs other than SUI/USDC it is required.
 - Solana: a token send opens the recipient's token account if they have none (a refundable deposit of about 0.00204 SOL paid by the sender). Unrecognised tokens in `get_wallet_balances` are often spam airdrops; never interact with a token you do not know. `sign_personal_message` refuses bytes that are a valid Solana transaction. The OpenOcean swap host can answer that Solana is unsupported (`get_swap_quote` then explains it and nothing is sent).
 - Sending a wallet's entire SUI, SOL or ETH balance needs a gas reserve, so a few dust units will remain. On Sui, one send can spend at most about the larger of the coin-object balance and the address balance, so a very large send may need to be split into two.
+- Solana `priority_fee` (whole SOL, total, at most 0.01; `0` pays none) and Sui `gas_budget` (whole SUI, at most 50) are optional on `send_asset`, `estimate_gas_fee`, `simulate_transaction`, `get_swap_quote` and `swap_tokens`. Without them the wallet picks a priority fee from recent network demand (Solana) or a budget from a dry run (Sui). A Sui budget too low for the transaction makes its dry run fail, so nothing is signed. They do not apply to transactions given as `transaction_bytes`, which carry their own.
 - Bitcoin: amounts are in BTC (at most 8 decimals). The fee is chosen by `fee_rate` (sat/vB, 1 to 1000) or `confirmation_target` (blocks, default 6). The wallet spends confirmed coins and its own unconfirmed change only, pays change back to its single address, and refuses dust and fees above Bitcoin Core's limits. A Bitcoin payment is replaceable until it confirms; check it with `get_transaction`. If an answer is lost the error gives the transaction id and the next send reconciles it, so never retry by hand. `simulate_transaction` fully builds and signs the payment in memory without sending it. `sign_personal_message` makes a BIP 322 signature.
 - Wallets are stored in `$AGENT_SAIFU_HOME` (default `~/.agent-saifu`).
 

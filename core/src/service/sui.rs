@@ -373,13 +373,15 @@ impl WalletService {
     // ---- building and sending ---------------------------------------------------------------------
 
     /// Assembles a transaction that spends `amount` of `coin_type`, dry-runs it to set the gas
-    /// budget, and dry-runs the final transaction again. Nothing is signed.
+    /// budget (`gas_budget` MIST when the caller chose one, otherwise one from the dry run), and
+    /// dry-runs the final transaction again. Nothing is signed.
     pub(super) fn sui_prepare(
         s: &Session<'_>,
         sui: &Holdings,
         coin_type: &str,
         amount: u64,
         spend: &Holdings,
+        gas_budget: Option<u64>,
         body: tx::Body<'_>,
     ) -> Result<Prepared, String> {
         let epoch = s.gql.epoch()?;
@@ -392,6 +394,14 @@ impl WalletService {
                 .map_err(|_| "the Sui node reported an invalid chain identifier".to_string())?,
             nonce: tx::fresh_nonce()?,
         };
+        if let Some(chosen) = gas_budget
+            && chosen < tx::min_budget(env.price)
+        {
+            return Err(format!(
+                "'gas_budget' is below the smallest budget Sui accepts at the current gas price: {} SUI",
+                coins::format_amount(u128::from(tx::min_budget(env.price)), coins::SUI_DECIMALS)
+            ));
+        }
         let spent_sui = if coins::is_sui(coin_type) { amount } else { 0 };
         if spend.total() < u128::from(amount) {
             return Err(tx::insufficient(coin_type, u128::from(amount), spend));
@@ -412,13 +422,23 @@ impl WalletService {
                 dry.error.as_deref().unwrap_or("unknown reason")
             ));
         }
-        let budget = tx::budget_from_simulation(&dry.gas, env.price);
+        let suggested = tx::budget_from_simulation(&dry.gas, env.price);
+        let budget = gas_budget.unwrap_or(suggested);
         let (transaction, _) =
             tx::assemble(s.owner, &env, budget, sui, coin_type, amount, spend, body)?;
         let simulation = s.gql.simulate(&tx::encode(&transaction)?)?;
         if !simulation.success {
+            let hint = if gas_budget.is_some() {
+                format!(
+                    " (the gas_budget of {} SUI may be too low; a dry run suggests about {} SUI)",
+                    coins::format_amount(u128::from(budget), coins::SUI_DECIMALS),
+                    coins::format_amount(u128::from(suggested), coins::SUI_DECIMALS)
+                )
+            } else {
+                String::new()
+            };
             return Err(format!(
-                "the transaction would fail, so nothing was signed: {}",
+                "the transaction would fail, so nothing was signed: {}{hint}",
                 simulation.error.as_deref().unwrap_or("unknown reason")
             ));
         }
@@ -519,6 +539,21 @@ impl WalletService {
         to: &str,
         amount: &str,
     ) -> Result<Value, String> {
+        self.sui_send_asset_with_budget(name, password, asset, to, amount, None)
+    }
+
+    /// Like `sui_send_asset`, with a gas budget (whole SUI) chosen by the caller instead of one
+    /// set from a dry run.
+    pub fn sui_send_asset_with_budget(
+        &self,
+        name: &str,
+        password: &str,
+        asset: &str,
+        to: &str,
+        amount: &str,
+        gas_budget: Option<&str>,
+    ) -> Result<Value, String> {
+        let gas_budget = gas_budget.map(tx::parse_gas_budget).transpose()?;
         let (record, vault) = self.unlock_sui(name, password)?;
         let recipient = parse_recipient(to, "to")?;
         let coin_type = coins::normalize_coin_type(asset).map_err(|e| format!("'asset': {e}"))?;
@@ -537,6 +572,7 @@ impl WalletService {
             &coin_type,
             raw,
             &spend,
+            gas_budget,
             &tx::transfer_body(recipient),
         )?;
         let submitted = Self::sui_submit(&s, &vault, &prepared.transaction)?;
@@ -551,6 +587,10 @@ impl WalletService {
                 (
                     "amount",
                     Value::String(coins::format_amount(u128::from(raw), decimals)),
+                ),
+                (
+                    "gas_budget_mist",
+                    Value::Number(prepared.transaction.gas_payment.budget.to_string()),
                 ),
             ],
         ))
@@ -712,6 +752,9 @@ impl WalletService {
                     "use either transaction_bytes, or asset + amount + to, not both".to_string(),
                 );
             }
+            if params.gas_budget.is_some() {
+                return Err("'gas_budget' applies to transfers the wallet builds; a transaction given as transaction_bytes already carries its own gas budget".to_string());
+            }
             let transaction = tx::decode(bytes)?;
             tx::check_signable(&transaction, &s.owner)?;
             Self::sui_check_chain(&transaction, s)?;
@@ -731,6 +774,11 @@ impl WalletService {
             ));
         }
         let to = params.to.as_deref().ok_or("'to' is required")?;
+        let gas_budget = params
+            .gas_budget
+            .as_deref()
+            .map(tx::parse_gas_budget)
+            .transpose()?;
         let recipient = parse_recipient(to, "to")?;
         let asset = params
             .asset
@@ -755,6 +803,7 @@ impl WalletService {
             &coin_type,
             raw,
             &spend,
+            gas_budget,
             &tx::transfer_body(recipient),
         )?;
         let budget = prepared.transaction.gas_payment.budget;

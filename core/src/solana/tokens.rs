@@ -103,6 +103,23 @@ pub fn format_sol(lamports: u64) -> String {
     format_amount(u128::from(lamports), super::tx::SOL_DECIMALS)
 }
 
+/// A priority fee given in whole SOL, as lamports. Zero is allowed (it means no priority fee);
+/// anything above `tx::MAX_PRIORITY_FEE_LAMPORTS` is refused so a typo cannot burn funds.
+pub fn parse_priority_fee(text: &str) -> Result<u64, String> {
+    let units = U256::parse_units(text.trim(), super::tx::SOL_DECIMALS)
+        .map_err(|e| format!("'priority_fee': {e}"))?;
+    let lamports = units
+        .to_u64()
+        .filter(|l| *l <= super::tx::MAX_PRIORITY_FEE_LAMPORTS)
+        .ok_or_else(|| {
+            format!(
+                "'priority_fee' is more than the {} SOL this wallet allows as a priority fee",
+                format_sol(super::tx::MAX_PRIORITY_FEE_LAMPORTS)
+            )
+        })?;
+    Ok(lamports)
+}
+
 /// Signed lamport or token-unit changes, e.g. `-0.25`.
 pub fn format_signed(amount: i128, decimals: u32) -> String {
     let text = format_amount(amount.unsigned_abs(), decimals);
@@ -193,6 +210,18 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    #[test]
+    fn priority_fees_are_whole_sol_with_a_ceiling() {
+        assert_eq!(parse_priority_fee("0").unwrap(), 0);
+        assert_eq!(parse_priority_fee(" 0.0001 ").unwrap(), 100_000);
+        assert_eq!(parse_priority_fee("0.000000001").unwrap(), 1);
+        assert_eq!(parse_priority_fee("0.01").unwrap(), 10_000_000);
+        for bad in ["0.010000001", "1", "-1", "abc", "", "0.0000000001", "1e-4"] {
+            assert!(parse_priority_fee(bad).is_err(), "{bad}");
+        }
+        assert!(parse_priority_fee("1").unwrap_err().contains("0.01 SOL"));
+    }
 
     #[test]
     fn known_tokens_are_valid_and_unique() {

@@ -41,6 +41,13 @@ pub(super) struct Prepared {
     pub fee_lamports: u64,
 }
 
+impl Prepared {
+    pub(super) fn priority_fee_lamports(&self) -> u64 {
+        let message = &self.transaction.message;
+        tx::priority_fee_lamports(message, &message.account_keys)
+    }
+}
+
 pub(super) struct Submitted {
     pub signature: String,
     pub status: Option<SignatureStatus>,
@@ -100,6 +107,25 @@ pub(super) fn compute_limit_for(units: u64) -> u32 {
         .saturating_add(units / 5)
         .saturating_add(1_000);
     u32::try_from(padded.min(tx::MAX_COMPUTE_UNITS)).unwrap_or(u32::MAX)
+}
+
+/// The optional `priority_fee` argument (whole SOL) as lamports.
+pub(super) fn parse_priority_option(text: Option<&str>) -> Result<Option<u64>, String> {
+    text.map(tokens::parse_priority_fee).transpose()
+}
+
+/// The price per compute unit to bid, in micro-lamports. A fee the caller asked for is spread over
+/// the transaction's compute-unit limit so the total is what they chose; otherwise the default
+/// (`fallback`, for example recent network demand) applies, capped.
+pub(super) fn priority_price(
+    requested: Option<u64>,
+    limit: u32,
+    fallback: impl FnOnce() -> u64,
+) -> u64 {
+    match requested {
+        Some(lamports) => tx::price_for_priority_fee(lamports, limit),
+        None => fallback().min(MAX_PRIORITY_MICRO_LAMPORTS),
+    }
 }
 
 pub(super) struct TransferPlan {
@@ -569,20 +595,25 @@ impl WalletService {
     }
 
     /// Assembles a transaction from `body`, dry-runs it to set the compute budget, and adds a
-    /// priority fee in line with what the cluster has recently paid. Nothing is signed. With
+    /// priority fee: `priority_fee` lamports in total when the caller chose one (zero means none),
+    /// otherwise one in line with what the cluster has recently paid. The final transaction is
+    /// simulated again so its effects include the priority fee. Nothing is signed. With
     /// `strict` false a wallet that cannot afford it still gets the fee estimate, with the
     /// shortfall reported as the dry run's error instead of failing the call.
     pub(super) fn solana_prepare(
         s: &Session<'_>,
         body: Vec<Instruction>,
         lamports_needed: u64,
+        priority_fee: Option<u64>,
         strict: bool,
     ) -> Result<Prepared, String> {
         let (blockhash, _) = s.rpc.latest_blockhash()?;
         let draft = Transaction::unsigned(tx::compile_legacy(&s.owner, &body, blockhash)?);
         let balance = s.rpc.balance(&s.owner)?;
         let base_fee = tx::fee_estimate(&draft.message, &draft.message.account_keys);
-        let needed = lamports_needed.saturating_add(base_fee);
+        let needed = lamports_needed
+            .saturating_add(base_fee)
+            .saturating_add(priority_fee.unwrap_or(0));
         if balance < needed {
             let shortfall = format!(
                 "insufficient SOL: the wallet holds {} SOL but needs about {} SOL (including the network fee)",
@@ -612,7 +643,7 @@ impl WalletService {
                 .units_consumed
                 .unwrap_or(tx::DEFAULT_UNITS_PER_INSTRUCTION),
         );
-        let price = s.rpc.recent_priority_fee().min(MAX_PRIORITY_MICRO_LAMPORTS);
+        let price = priority_price(priority_fee, limit, || s.rpc.recent_priority_fee());
         let mut instructions = vec![tx::set_compute_unit_limit(limit)];
         if price > 0 {
             instructions.push(tx::set_compute_unit_price(price));
@@ -620,8 +651,15 @@ impl WalletService {
         instructions.extend(body);
         let message = tx::compile_legacy(&s.owner, &instructions, blockhash)?;
         let fee_lamports = tx::fee_estimate(&message, &message.account_keys);
+        let transaction = Transaction::unsigned(message);
+        let effects = effects::simulate_effects(&s.rpc, &transaction, &s.owner)?;
+        if strict && let Some(error) = &effects.error {
+            return Err(format!(
+                "the transaction would fail, so nothing was signed: {error}"
+            ));
+        }
         Ok(Prepared {
-            transaction: Transaction::unsigned(message),
+            transaction,
             effects,
             fee_lamports,
         })
@@ -736,10 +774,31 @@ impl WalletService {
         to: &str,
         amount: &str,
     ) -> Result<Value, String> {
+        self.solana_send_asset_with_priority(name, password, asset, to, amount, None)
+    }
+
+    /// Like `solana_send_asset`, paying `priority_fee` (whole SOL, in total) as the priority fee
+    /// instead of the default that follows recent network demand.
+    pub fn solana_send_asset_with_priority(
+        &self,
+        name: &str,
+        password: &str,
+        asset: &str,
+        to: &str,
+        amount: &str,
+        priority_fee: Option<&str>,
+    ) -> Result<Value, String> {
+        let priority_fee = parse_priority_option(priority_fee)?;
         let (record, vault) = self.unlock_solana(name, password)?;
         let s = self.solana_session(&vault)?;
         let plan = Self::solana_plan_transfer(&s, asset, to, amount)?;
-        let mut prepared = Self::solana_prepare(&s, plan.body.clone(), plan.lamports_needed, true)?;
+        let mut prepared = Self::solana_prepare(
+            &s,
+            plan.body.clone(),
+            plan.lamports_needed,
+            priority_fee,
+            true,
+        )?;
         let submitted = self.solana_submit(&s, &vault, &mut prepared.transaction)?;
         let mut pairs = vec![
             ("wallet", Value::String(record.name)),
@@ -758,6 +817,10 @@ impl WalletService {
             (
                 "network_fee_sol",
                 Value::String(tokens::format_sol(prepared.fee_lamports)),
+            ),
+            (
+                "priority_fee_sol",
+                Value::String(tokens::format_sol(prepared.priority_fee_lamports())),
             ),
         ];
         if plan.creates_token_account {
@@ -991,6 +1054,9 @@ impl WalletService {
                     "use either transaction_bytes, or asset + amount + to, not both".to_string(),
                 );
             }
+            if params.priority_fee.is_some() {
+                return Err("'priority_fee' applies to transfers the wallet builds; a transaction given as transaction_bytes carries its own compute-budget instructions".to_string());
+            }
             let transaction = Transaction::from_text(bytes)?;
             if transaction.message.signer_index(&s.owner).is_none() {
                 return Err("this wallet is not one of the transaction's signers".to_string());
@@ -1021,8 +1087,10 @@ impl WalletService {
             .amount
             .as_deref()
             .ok_or("'amount' is required together with 'asset'")?;
+        let priority_fee = parse_priority_option(params.priority_fee.as_deref())?;
         let plan = Self::solana_plan_transfer(s, asset, to, amount)?;
-        let prepared = Self::solana_prepare(s, plan.body, plan.lamports_needed, false)?;
+        let prepared =
+            Self::solana_prepare(s, plan.body, plan.lamports_needed, priority_fee, false)?;
         Ok((prepared, None))
     }
 
@@ -1055,6 +1123,10 @@ impl WalletService {
                 Value::String(tokens::format_sol(prepared.fee_lamports)),
             ),
             (
+                "priority_fee_sol",
+                Value::String(tokens::format_sol(prepared.priority_fee_lamports())),
+            ),
+            (
                 "fee_usdc",
                 usd.map_or(Value::Null, |v| Value::String(format!("{v:.4}"))),
             ),
@@ -1065,7 +1137,7 @@ impl WalletService {
             (
                 "note",
                 Value::str(
-                    "Solana's base fee is 5,000 lamports per signature; transactions sent by this wallet add a small priority fee (capped at 0.00005 SOL) that follows recent network demand. Opening a token account for a recipient who has none adds a refundable deposit (about 0.00204 SOL) that is not part of this fee.",
+                    "Solana's base fee is 5,000 lamports per signature; transactions sent by this wallet add a small priority fee that follows recent network demand (capped at 0.00005 SOL), or the total you choose with priority_fee (up to 0.01 SOL), which is included in fee_sol. Opening a token account for a recipient who has none adds a refundable deposit (about 0.00204 SOL) that is not part of this fee.",
                 ),
             ),
         ];
@@ -1094,6 +1166,10 @@ impl WalletService {
             (
                 "fee_lamports",
                 Value::String(prepared.fee_lamports.to_string()),
+            ),
+            (
+                "priority_fee_sol",
+                Value::String(tokens::format_sol(prepared.priority_fee_lamports())),
             ),
             ("result", Self::solana_effects_json(&s, &prepared.effects)),
             (

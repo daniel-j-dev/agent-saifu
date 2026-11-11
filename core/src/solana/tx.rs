@@ -798,6 +798,20 @@ pub fn priority_fee_lamports(message: &Message, accounts: &[Pubkey]) -> u64 {
     u64::try_from(micro.div_ceil(1_000_000)).unwrap_or(u64::MAX)
 }
 
+/// The most a caller may choose to pay as a priority fee: 0.01 SOL.
+pub const MAX_PRIORITY_FEE_LAMPORTS: u64 = 10_000_000;
+
+/// The price per compute unit, in micro-lamports, at which a transaction with a limit of `limit`
+/// units pays `lamports` in total. Rounded down so the fee never exceeds what was asked for, but
+/// never zero when something was asked for.
+pub fn price_for_priority_fee(lamports: u64, limit: u32) -> u64 {
+    if lamports == 0 || limit == 0 {
+        return 0;
+    }
+    let price = u128::from(lamports) * 1_000_000 / u128::from(limit);
+    u64::try_from(price).unwrap_or(u64::MAX).max(1)
+}
+
 /// Base fee (per signature) plus priority fee, in lamports.
 pub fn fee_estimate(message: &Message, accounts: &[Pubkey]) -> u64 {
     u64::from(message.header.required_signatures)
@@ -1206,5 +1220,26 @@ mod tests {
         ];
         let m = compile_legacy(&owner(), &ixs, [0u8; 32]).unwrap();
         assert_eq!(priority_fee_lamports(&m, &m.account_keys), 1);
+    }
+
+    #[test]
+    fn a_requested_priority_fee_becomes_a_price_per_unit() {
+        // 100,000 lamports over 200,000 units = 500,000 micro-lamports per unit
+        assert_eq!(price_for_priority_fee(100_000, 200_000), 500_000);
+        assert_eq!(price_for_priority_fee(0, 200_000), 0);
+        assert_eq!(price_for_priority_fee(5, 0), 0);
+        // rounded down, so the total never exceeds the request, but never zero
+        assert_eq!(price_for_priority_fee(1, 1_400_000), 1);
+        assert_eq!(price_for_priority_fee(10, 3), 3_333_333);
+        for (lamports, limit) in [(2u64, 1_400_000u32), (7, 123_457), (100_000, 200_000)] {
+            let ixs = [
+                set_compute_unit_limit(limit),
+                set_compute_unit_price(price_for_priority_fee(lamports, limit)),
+                system_transfer(&owner(), &key(2), 1),
+            ];
+            let m = compile_legacy(&owner(), &ixs, [0u8; 32]).unwrap();
+            let paid = priority_fee_lamports(&m, &m.account_keys);
+            assert!((1..=lamports).contains(&paid), "{lamports} {limit} {paid}");
+        }
     }
 }

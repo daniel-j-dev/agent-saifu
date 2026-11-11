@@ -184,6 +184,44 @@ fn reject_fee_options_for(a: &Args, chain: Blockchain) -> Result<(), String> {
     Ok(())
 }
 
+/// Fee choices for Solana (`priority_fee`) and Sui (`gas_budget`) transfers and swaps.
+fn network_fee_params() -> Vec<Param> {
+    vec![
+        opt(
+            "priority_fee",
+            Kind::Text,
+            "Solana wallets only: the total priority fee to pay on top of the base fee, in whole SOL, e.g. \"0.0001\" (at most 0.01 SOL; \"0\" pays none). It speeds up inclusion when the network is busy. Default: a fee that follows recent network demand (capped at 0.00005 SOL).",
+        ),
+        opt(
+            "gas_budget",
+            Kind::Text,
+            "Sui wallets only: the gas budget, the most the transaction may spend on gas, in whole SUI, e.g. \"0.05\" (at most 50 SUI). Only what is used is charged. A budget too low for the transaction makes its dry run fail, so nothing is sent. Default: set from a dry run.",
+        ),
+    ]
+}
+
+fn with_network_fee_params(mut params: Vec<Param>) -> Vec<Param> {
+    params.extend(network_fee_params());
+    params
+}
+
+/// `priority_fee` exists only for Solana wallets and `gas_budget` only for Sui wallets.
+fn reject_network_fee_options_for(a: &Args, chain: Blockchain) -> Result<(), String> {
+    if chain != Blockchain::Solana && a.opt_str("priority_fee")?.is_some() {
+        return Err(format!(
+            "'priority_fee' is for Solana wallets; {} does not use it",
+            chain.display_name()
+        ));
+    }
+    if chain != Blockchain::Sui && a.opt_str("gas_budget")?.is_some() {
+        return Err(format!(
+            "'gas_budget' is for Sui wallets; {} does not use it",
+            chain.display_name()
+        ));
+    }
+    Ok(())
+}
+
 /// Sui, Solana and Bitcoin wallets are bound to one network, so a chain ID would be meaningless
 /// (or a mistake).
 fn reject_chain_id_for(a: &Args, chain: Blockchain) -> Result<(), String> {
@@ -272,6 +310,8 @@ fn intent_from(a: &Args) -> Result<IntentParams, String> {
         asset: a.opt_str("asset")?.map(str::to_string),
         amount: a.opt_str("amount")?.map(str::to_string),
         transaction_bytes: a.opt_str("transaction_bytes")?.map(str::to_string),
+        priority_fee: a.opt_str("priority_fee")?.map(str::to_string),
+        gas_budget: a.opt_str("gas_budget")?.map(str::to_string),
     })
 }
 
@@ -290,6 +330,8 @@ fn swap_params(a: &Args, with_min_receive: bool) -> Result<SwapParams, String> {
         } else {
             None
         },
+        priority_fee: a.opt_str("priority_fee")?.map(str::to_string),
+        gas_budget: a.opt_str("gas_budget")?.map(str::to_string),
     })
 }
 
@@ -336,6 +378,7 @@ fn swap_inputs(with_min_receive: bool) -> Vec<Param> {
     if with_min_receive {
         p.push(opt("min_receive", Kind::Text, "Safety floor in whole units of to_token. If the fresh quote's guaranteed minimum is lower, nothing is swapped. Use the minimum_amount from get_swap_quote."));
     }
+    p.extend(network_fee_params());
     p
 }
 
@@ -530,7 +573,7 @@ fn definitions() -> Vec<Tool> {
         Tool {
             name: "send_asset",
             description: "Send the native coin or a token (an ERC-20 on Ethereum; SUI or any coin type on Sui; SOL or any SPL / Token-2022 token on Solana; BTC on Bitcoin) to another address and broadcast the transaction. Irreversible. Use simulate_transaction first when unsure. Sui and Solana transfers are dry-run before they are signed. Bitcoin: the wallet chooses the coins, pays the change back to its own address, signs a replaceable (BIP 125) native SegWit transaction and checks it against Bitcoin Core's limits (dust, maximum fee) before broadcasting. Returns the transaction hash (Ethereum), digest (Sui), signature (Solana) or transaction id (Bitcoin).",
-            params: with_fee_params(vec![
+            params: with_network_fee_params(with_fee_params(vec![
                 wallet(),
                 password(),
                 chain_id_for_eth(),
@@ -554,13 +597,14 @@ fn definitions() -> Vec<Tool> {
                     Kind::Integer,
                     "Ethereum only: override the automatically estimated gas limit.",
                 ),
-            ]),
+            ])),
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
                 let chain = s.chain_of(name, pw)?;
                 if chain != Blockchain::Bitcoin {
                     reject_fee_options_for(a, chain)?;
                 }
+                reject_network_fee_options_for(a, chain)?;
                 if chain != Blockchain::Ethereum {
                     reject_chain_id_for(a, chain)?;
                     if a.opt_u64("gas_limit")?.is_some() {
@@ -571,11 +615,25 @@ fn definitions() -> Vec<Tool> {
                     }
                     let (asset, to, amount) = (a.str("asset")?, a.str("to")?, a.str("amount")?);
                     return match chain {
-                        Blockchain::Solana => s.solana_send_asset(name, pw, asset, to, amount),
+                        Blockchain::Solana => s.solana_send_asset_with_priority(
+                            name,
+                            pw,
+                            asset,
+                            to,
+                            amount,
+                            a.opt_str("priority_fee")?,
+                        ),
                         Blockchain::Bitcoin => {
                             s.bitcoin_send_asset(name, pw, asset, to, amount, &fee_from(a)?)
                         }
-                        _ => s.sui_send_asset(name, pw, asset, to, amount),
+                        _ => s.sui_send_asset_with_budget(
+                            name,
+                            pw,
+                            asset,
+                            to,
+                            amount,
+                            a.opt_str("gas_budget")?,
+                        ),
                     };
                 }
                 s.send_asset(
@@ -682,6 +740,7 @@ fn definitions() -> Vec<Tool> {
                 let mut p = vec![wallet(), password(), chain_id_for_eth()];
                 p.extend(intent_params());
                 p.extend(fee_params());
+                p.extend(network_fee_params());
                 p
             },
             handler: |s, a| {
@@ -690,6 +749,7 @@ fn definitions() -> Vec<Tool> {
                 if chain != Blockchain::Bitcoin {
                     reject_fee_options_for(a, chain)?;
                 }
+                reject_network_fee_options_for(a, chain)?;
                 if chain != Blockchain::Ethereum {
                     reject_chain_id_for(a, chain)?;
                     let params = intent_from(a)?;
@@ -712,6 +772,7 @@ fn definitions() -> Vec<Tool> {
                 let mut p = vec![wallet(), password(), chain_id_for_eth()];
                 p.extend(intent_params());
                 p.extend(fee_params());
+                p.extend(network_fee_params());
                 p
             },
             handler: |s, a| {
@@ -720,6 +781,7 @@ fn definitions() -> Vec<Tool> {
                 if chain != Blockchain::Bitcoin {
                     reject_fee_options_for(a, chain)?;
                 }
+                reject_network_fee_options_for(a, chain)?;
                 if chain != Blockchain::Ethereum {
                     reject_chain_id_for(a, chain)?;
                     let params = intent_from(a)?;
@@ -865,7 +927,9 @@ fn definitions() -> Vec<Tool> {
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
                 let params = swap_params(a, false)?;
-                match s.chain_of(name, pw)? {
+                let chain = s.chain_of(name, pw)?;
+                reject_network_fee_options_for(a, chain)?;
+                match chain {
                     Blockchain::Sui => s.sui_swap_quote(name, pw, &params),
                     Blockchain::Solana => s.solana_swap_quote(name, pw, &params),
                     Blockchain::Bitcoin => Err(BITCOIN_NO_SWAPS.to_string()),
@@ -883,7 +947,9 @@ fn definitions() -> Vec<Tool> {
             handler: |s, a| {
                 let (name, pw) = (a.str("wallet_name")?, a.str("password")?);
                 let params = swap_params(a, true)?;
-                match s.chain_of(name, pw)? {
+                let chain = s.chain_of(name, pw)?;
+                reject_network_fee_options_for(a, chain)?;
+                match chain {
                     Blockchain::Sui => s.sui_swap_tokens(name, pw, &params),
                     Blockchain::Solana => s.solana_swap_tokens(name, pw, &params),
                     Blockchain::Bitcoin => Err(BITCOIN_NO_SWAPS.to_string()),
@@ -1824,12 +1890,11 @@ mod tests {
                     .iter()
                     .any(|p| p.name.contains("key") || p.name.contains("secret"))
             );
-            assert!(
-                !tool
-                    .params
-                    .iter()
-                    .any(|p| p.name.contains("fee") || p.name.contains("referrer"))
-            );
+            // the caller may choose the network fee of their own transaction (`priority_fee`),
+            // but never the aggregator's service fee
+            assert!(!tool.params.iter().any(|p| {
+                (p.name.contains("fee") && p.name != "priority_fee") || p.name.contains("referrer")
+            }));
         }
         assert!(
             !find("get_swap_quote")

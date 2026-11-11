@@ -24,6 +24,7 @@ pub const MAX_GAS_OBJECTS: usize = 256;
 const MAX_MERGE_INPUTS: usize = 250;
 /// Same safety margin the official TypeScript SDK adds on top of the simulated computation cost.
 const BUDGET_OVERHEAD_UNITS: u64 = 1000;
+const MIN_BUDGET_UNITS: u64 = 2000;
 pub const MAX_TRANSACTION_BYTES: usize = 128 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
@@ -105,6 +106,24 @@ pub fn select_gas(sui: &Holdings, budget: u64, also_needed: u64) -> Result<GasCh
 pub fn max_budget(sui: &Holdings) -> u64 {
     let available = sui.coin_total().max(sui.address_balance);
     u64::try_from(available.min(u128::from(MAX_GAS_BUDGET))).unwrap_or(MAX_GAS_BUDGET)
+}
+
+/// A gas budget given in whole SUI, as MIST. It may not exceed the protocol's maximum budget.
+pub fn parse_gas_budget(text: &str) -> Result<u64, String> {
+    let budget =
+        coins::parse_amount(text, coins::SUI_DECIMALS).map_err(|e| format!("'gas_budget': {e}"))?;
+    if budget > MAX_GAS_BUDGET {
+        return Err(format!(
+            "'gas_budget' is more than the protocol's maximum of {} SUI",
+            coins::format_amount(u128::from(MAX_GAS_BUDGET), coins::SUI_DECIMALS)
+        ));
+    }
+    Ok(budget)
+}
+
+/// The smallest budget the protocol accepts: 2,000 gas units at the reference price.
+pub fn min_budget(price: u64) -> u64 {
+    price.saturating_mul(MIN_BUDGET_UNITS)
 }
 
 /// Budget for a transaction whose dry run cost `gas`: computation plus a margin, plus storage
@@ -696,6 +715,19 @@ pub mod tests {
             rebate: 0,
         };
         assert_eq!(budget_from_simulation(&huge, 1000), MAX_GAS_BUDGET);
+    }
+
+    #[test]
+    fn gas_budgets_are_whole_sui_within_the_protocol_maximum() {
+        assert_eq!(parse_gas_budget("0.05").unwrap(), 50_000_000);
+        assert_eq!(parse_gas_budget(" 50 ").unwrap(), MAX_GAS_BUDGET);
+        assert_eq!(parse_gas_budget("0.000000001").unwrap(), 1);
+        for bad in ["50.000000001", "51", "0", "-1", "abc", "", "0.0000000001"] {
+            assert!(parse_gas_budget(bad).is_err(), "{bad}");
+        }
+        assert!(parse_gas_budget("51").unwrap_err().contains("50 SUI"));
+        assert_eq!(min_budget(1000), 2_000_000);
+        assert_eq!(min_budget(u64::MAX), u64::MAX);
     }
 
     #[test]

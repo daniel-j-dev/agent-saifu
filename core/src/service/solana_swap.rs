@@ -8,7 +8,7 @@
 //! asked of Jupiter as a platform fee, paid into the fee recipient's token account for the
 //! token bought, which the transaction opens when it does not exist yet.
 
-use super::solana::{MAX_PRIORITY_MICRO_LAMPORTS, Session, compute_limit_for};
+use super::solana::{Session, compute_limit_for, parse_priority_option, priority_price};
 use super::*;
 use crate::solana::address::{self as saddr, Pubkey};
 use crate::solana::effects::{self, Effects};
@@ -139,6 +139,7 @@ impl WalletService {
         if p.to_address.is_some() {
             return Err("'to_address' is not supported for Solana swaps: the bought tokens always arrive in this wallet".to_string());
         }
+        let priority_fee = parse_priority_option(p.priority_fee.as_deref())?;
         if !s.network.is_mainnet() {
             return Err(format!(
                 "Jupiter swaps are only available on Solana mainnet; this wallet is bound to {}",
@@ -179,6 +180,7 @@ impl WalletService {
             slippage_bps,
             min_receive,
             fee_account: fee.as_ref().map(|f| f.account),
+            fee_bps: fee.as_ref().map_or(0, |f| f.bps),
         };
         let (blockhash, _) = s.rpc.latest_blockhash()?;
         let simulatable = balance >= u128::from(amount);
@@ -258,10 +260,11 @@ impl WalletService {
         } else {
             (None, UNSIMULATED_COMPUTE_UNITS)
         };
-        let price = quote
-            .compute_price
-            .unwrap_or_else(|| s.rpc.recent_priority_fee())
-            .min(MAX_PRIORITY_MICRO_LAMPORTS);
+        let price = priority_price(priority_fee, units, || {
+            quote
+                .compute_price
+                .unwrap_or_else(|| s.rpc.recent_priority_fee())
+        });
         let mut budget = vec![tx::set_compute_unit_limit(units)];
         if price > 0 {
             budget.push(tx::set_compute_unit_price(price));
@@ -413,14 +416,17 @@ impl WalletService {
                     ("token", plan.to.token_json()),
                     ("symbol", Value::str(&plan.to.symbol)),
                     ("expected_amount", Value::String(fmt_to(q.out_amount))),
-                    ("minimum_amount", Value::String(fmt_to(q.min_out_amount))),
+                    (
+                        "minimum_amount",
+                        Value::String(fmt_to(q.guaranteed_minimum())),
+                    ),
                     (
                         "expected_amount_raw",
                         Value::String(q.out_amount.to_string()),
                     ),
                     (
                         "minimum_amount_raw",
-                        Value::String(q.min_out_amount.to_string()),
+                        Value::String(q.guaranteed_minimum().to_string()),
                     ),
                     ("recipient", Value::String(saddr::to_text(&s.owner))),
                 ]),

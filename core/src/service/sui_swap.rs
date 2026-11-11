@@ -9,7 +9,7 @@ use super::*;
 use crate::eth::prices::format_usd;
 use crate::sui::cetus::{self, Amounts, SuiSwapFee, Verified};
 use crate::sui::coins::{self, SUI_COIN_TYPE};
-use crate::sui::tx::Holdings;
+use crate::sui::tx::{self, Holdings};
 use sui_sdk_types::Address as SuiAddress;
 
 struct SwapPlan {
@@ -26,6 +26,8 @@ struct SwapPlan {
     /// Whether the quote was checked against a price that does not come from the aggregator.
     independent_price: bool,
     has_min_receive: bool,
+    /// The gas budget chosen by the caller, in MIST.
+    gas_budget: Option<u64>,
     sui: Holdings,
     spend: Holdings,
 }
@@ -66,6 +68,11 @@ impl WalletService {
             return Err("from_token and to_token are the same coin".to_string());
         }
         let (from_symbol, from_decimals) = Self::sui_required_decimals(s, &from_type)?;
+        let gas_budget = p
+            .gas_budget
+            .as_deref()
+            .map(tx::parse_gas_budget)
+            .transpose()?;
         let (to_symbol, to_decimals) = Self::sui_required_decimals(s, &to_type)?;
         let amount =
             coins::parse_amount(&p.amount, from_decimals).map_err(|e| format!("'amount': {e}"))?;
@@ -129,6 +136,7 @@ impl WalletService {
             amounts,
             independent_price,
             has_min_receive: min_receive.is_some(),
+            gas_budget,
             sui,
             spend,
         })
@@ -188,6 +196,7 @@ impl WalletService {
             &plan.from_type,
             plan.amount,
             &plan.spend,
+            plan.gas_budget,
             &body,
         )
     }
