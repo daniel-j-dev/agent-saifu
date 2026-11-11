@@ -513,6 +513,20 @@ fn balances_node() -> SuiMock {
 }
 
 #[test]
+fn a_public_view_refreshes_balances_without_the_password() {
+    let f = build(balances_node(), |s| s);
+    import(&f);
+    let unlocked = f.service.sui_balances("w", PW).unwrap();
+    let view = f.service.public_view("w", PW).unwrap();
+    assert_eq!(view.wallet(), "w");
+    assert_eq!(view.address(), text(&unlocked, &["address"]));
+    assert_eq!(f.service.balances_of_view(&view).unwrap(), unlocked);
+    // and again, as a refresh button would
+    assert_eq!(f.service.balances_of_view(&view).unwrap(), unlocked);
+    assert!(f.service.public_view("w", "wrong-password").is_err());
+}
+
+#[test]
 fn balances_list_every_coin_with_values_and_hide_empty_ones() {
     let f = build(balances_node(), |s| s);
     import(&f);
@@ -709,6 +723,101 @@ fn a_bad_gas_budget_is_refused_before_anything_is_signed() {
     assert_eq!(f.mock.post_count("executeTransaction"), 0);
 }
 
+/// Dry-run effects with chosen gas numbers (`effects_data` uses fixed ones).
+fn effects_with_gas(status: &str, error: Option<&str>, gas: (u64, u64, u64)) -> String {
+    let error = error.map_or("null".to_string(), |e| format!(r#"{{"message":"{e}"}}"#));
+    format!(
+        r#"{{"simulateTransaction":{{"effects":{{"digest":"FAKEDIGEST","status":"{status}","executionError":{error},"gasEffects":{{"gasSummary":{{"computationCost":{},"storageCost":{},"storageRebate":{}}}}},"balanceChangesJson":[{}]}}}}}}"#,
+        gas.0,
+        gas.1,
+        gas.2,
+        sui_loss(1_500_000)
+    )
+}
+
+#[test]
+fn a_budget_estimated_with_many_coins_is_raised_when_the_real_transaction_needs_more() {
+    // The first dry run (every coin merged) earns a large storage rebate, so the budget it
+    // suggests is tiny; the real transaction, which uses fewer coins, then runs out of gas.
+    // That is what mainnet showed as "Insufficient Gas" on ordinary sends.
+    let cheap = effects_with_gas("SUCCESS", None, (100_000, 1_976_000, 1_975_000));
+    let short = effects_with_gas(
+        "FAILURE",
+        Some("Insufficient Gas."),
+        (100_000, 988_000, 987_000),
+    );
+    let fine = effects_with_gas("SUCCESS", None, (100_000, 1_976_000, 987_000));
+    let f = build(
+        SuiMock::new()
+            .data_seq("simulateTransaction", vec![cheap, short, fine])
+            .extend(node(&[(1, 5_000_000_000)], 0)),
+        |s| s,
+    );
+    import(&f);
+    f.service
+        .sui_send_asset("w", PW, "native", &other_address(), "1")
+        .unwrap();
+    let (transaction, _) = submitted(&f);
+    // computation + the usual margin + the whole storage charge, no rebate counted
+    assert_eq!(
+        transaction.gas_payment.budget,
+        100_000 + 100_000 + 1_976_000
+    );
+    assert_eq!(f.mock.post_count("simulateTransaction"), 3);
+}
+
+#[test]
+fn a_budget_the_caller_chose_is_never_raised() {
+    let cheap = effects_with_gas("SUCCESS", None, (100_000, 1_976_000, 1_975_000));
+    let short = effects_with_gas(
+        "FAILURE",
+        Some("Insufficient Gas."),
+        (100_000, 988_000, 987_000),
+    );
+    let f = build(
+        SuiMock::new()
+            .data_seq("simulateTransaction", vec![cheap, short])
+            .extend(node(&[(1, 5_000_000_000)], 0)),
+        |s| s,
+    );
+    import(&f);
+    let err = f
+        .service
+        .sui_send_asset_with_budget("w", PW, "native", &other_address(), "1", Some("0.0002"))
+        .unwrap_err();
+    assert!(
+        err.contains("Insufficient Gas") && err.contains("gas_budget of 0.0002 SUI"),
+        "{err}"
+    );
+    assert_eq!(f.mock.post_count("executeTransaction"), 0);
+}
+
+#[test]
+fn running_short_of_gas_after_widening_says_to_send_less() {
+    let cheap = effects_with_gas("SUCCESS", None, (100_000, 1_976_000, 1_975_000));
+    let short = effects_with_gas(
+        "FAILURE",
+        Some("Insufficient Gas."),
+        (100_000, 988_000, 987_000),
+    );
+    let f = build(
+        SuiMock::new()
+            .data_seq(
+                "simulateTransaction",
+                vec![cheap, short.clone(), short.clone(), short.clone(), short],
+            )
+            .extend(node(&[(1, 5_000_000_000)], 0)),
+        |s| s,
+    );
+    import(&f);
+    let err = f
+        .service
+        .sui_send_asset("w", PW, "native", &other_address(), "1")
+        .unwrap_err();
+    assert!(err.contains("send a little less"), "{err}");
+    assert_eq!(f.mock.post_count("executeTransaction"), 0);
+}
+
 #[test]
 fn a_budget_too_low_for_the_transaction_is_never_signed_and_says_what_to_use() {
     let ok = effects_data(
@@ -849,6 +958,23 @@ fn a_wallet_holding_only_an_address_balance_pays_gas_from_it() {
             ..
         }
     ));
+}
+
+#[test]
+fn most_of_a_balance_split_between_coins_and_an_address_balance_can_be_sent() {
+    // 2.4 SUI in total: neither part alone covers 2.1 SUI plus gas, together they do.
+    for (coins, address_balance) in [
+        (vec![(1, 1_200_000_000)], 1_200_000_000u128),
+        (vec![(1, 1_200_000_000), (2, 1_200_000_000)], 0),
+        (vec![(1, 400_000_000), (2, 300_000_000)], 1_700_000_000),
+    ] {
+        let f = build(node(&coins, address_balance), |s| s);
+        import(&f);
+        f.service
+            .sui_send_asset("w", PW, "native", &other_address(), "2.1")
+            .unwrap_or_else(|e| panic!("{coins:?} + {address_balance}: {e}"));
+        assert_eq!(f.mock.post_count("executeTransaction"), 1);
+    }
 }
 
 #[test]

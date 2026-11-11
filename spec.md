@@ -244,6 +244,12 @@ Sui support uses the official Sui Rust SDK (https://github.com/MystenLabs/sui-ru
 
 Ethereum mainnet RPC `ethereum-rpc.publicnode.com`, CoinGecko public API (prices), a Blockscout explorer (`eth.blockscout.com`, history), and an OpenOcean v4 API host (`open-api.de1.exchange`, swaps; no key). The WalletConnect relay (`relay.walletconnect.org`, needs a free project ID). Custom networks supply their own RPC and explorer. For Sui: the network's GraphQL endpoint (`graphql.mainnet.sui.io`, `graphql.testnet.sui.io` or `graphql.devnet.sui.io`; reads, dry runs, submission) and the Cetus aggregator (`api-sui.cetus.zone`, routes for swaps and indicative prices; no key); SUI prices also come from CoinGecko. For Solana: the cluster's JSON-RPC endpoint (`api.mainnet-beta.solana.com`, `api.devnet.solana.com` or `api.testnet.solana.com`, configurable in `core/src/solana_config.rs`; reads, simulation, submission), the Jupiter Swap API (`api.jup.ag/swap/v2/build`, swaps; keyless, no key), `explorer.solana.com` links, and CoinGecko for SOL and token prices. For Bitcoin: an Esplora-compatible API (`blockstream.info/api` for mainnet, `mempool.space/testnet4/api` and `mempool.space/signet/api`, configurable in `core/src/bitcoin_config.rs`; reads, fee estimates, broadcasting), `mempool.space` explorer links, and CoinGecko for BTC prices.
 
+## UI
+
+`ui/` holds an optional Dioxus app (desktop, Android and iOS) that follows `saifu-app-design/`. It is a separate Rust crate that links `core/` as a library and calls the same tools as the MCP server; the MCP server never depends on it. See [ui/README.md](ui/README.md). The Agent tab is a placeholder for now.
+
+Library-only addition for apps: `WalletService::public_view(name, password)` unlocks a wallet once and keeps only its public facts (address, bound network, or an Ethereum wallet's networks and tokens) in a `PublicView`; `balances_of_view` then answers like `get_wallet_balances` with no password, and no key is ever kept. It is not an MCP tool, so an agent still needs the password for every read. The UI holds these views in memory until it closes.
+
 ## Usage Examples
 
 Note: The examples below are for development and use `cargo run -q`. To use the built executable instead, run it directly and type one JSON request per line, or pipe a request into it for a one-shot command: `echo '{...}' | ./executable`. MCP clients normally launch the executable themselves.

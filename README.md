@@ -21,7 +21,9 @@ Built from the ground up in Rust. Driven entirely through MCP.
 | Solana (mainnet, devnet, testnet; swaps on mainnet via Jupiter) | ✅ Fully Covered |
 | Bitcoin (mainnet, testnet4, signet; native SegWit) | ✅ Fully Covered |
 
+Optional UI for humans is being built 🔨
 <br>
+
 
 
 </div>
@@ -136,6 +138,7 @@ See [**spec.md**](spec.md) for every tool, the full security design, setup instr
 - **No double payments:** signed transactions are recorded before broadcast, so a lost response is never paid twice.
 - **Minimal dependencies:** hashing, ABI, RLP, EIP-712, BIP32/39 and WalletConnect logic are implemented in-repo and tested against published vectors.
 - **Encrypted export:** back up a wallet as a ZIP protected with MetaMask's vault scheme.
+- **Optional app:** [`ui/`](ui) is a Dioxus app (desktop, Android, iOS) on top of the same wallet engine, for people who want to use the wallet themselves. It is a separate crate; the MCP server in `core/` works on its own.
 
 ## Disclaimer
 

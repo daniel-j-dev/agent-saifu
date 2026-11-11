@@ -522,6 +522,16 @@ fn bitcoin_wallets_are_refused_by_other_chains_tools() {
 // ---- balances -------------------------------------------------------------------------------
 
 #[test]
+fn a_public_view_refreshes_balances_without_the_password() {
+    let f = fx(Node::new(vec![coin(1, 150_000), pending_coin(2, 50_000)]));
+    let unlocked = f.service.bitcoin_balances("w", PW).unwrap();
+    let view = f.service.public_view("w", PW).unwrap();
+    assert_eq!(view.address(), text(&unlocked, &["address"]));
+    assert_eq!(f.service.balances_of_view(&view).unwrap(), unlocked);
+    assert!(f.service.public_view("w", "wrong-password").is_err());
+}
+
+#[test]
 fn balances_show_confirmed_and_pending_amounts_with_a_usd_value() {
     let f = fx(
         Node::new(vec![coin(1, 150_000), pending_coin(2, 50_000)]).get(

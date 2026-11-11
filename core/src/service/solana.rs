@@ -142,19 +142,28 @@ pub(super) struct TransferPlan {
 
 impl WalletService {
     pub(super) fn solana_session<'a>(&'a self, vault: &SolanaVault) -> Result<Session<'a>, String> {
-        let rpc = SolanaRpc::new(&*self.http, vault.network.rpc_url());
+        self.solana_session_for(vault.network, vault.public_key()?)
+    }
+
+    /// A session for reading an address, which needs no key.
+    pub(super) fn solana_session_for<'a>(
+        &'a self,
+        network: SolanaNetwork,
+        owner: Pubkey,
+    ) -> Result<Session<'a>, String> {
+        let rpc = SolanaRpc::new(&*self.http, network.rpc_url());
         let genesis = rpc.genesis_hash()?;
-        if genesis != vault.network.genesis_hash() {
+        if genesis != network.genesis_hash() {
             return Err(format!(
                 "the Solana node at {} does not serve Solana {} (it reported another genesis hash); refusing to use it",
-                url_host(vault.network.rpc_url()),
-                cluster_name(vault.network)
+                url_host(network.rpc_url()),
+                cluster_name(network)
             ));
         }
         Ok(Session {
             rpc,
-            network: vault.network,
-            owner: vault.public_key()?,
+            network,
+            owner,
         })
     }
 
@@ -312,6 +321,14 @@ impl WalletService {
     pub fn solana_balances(&self, name: &str, password: &str) -> Result<Value, String> {
         let (record, vault) = self.unlock_solana(name, password)?;
         let s = self.solana_session(&vault)?;
+        self.solana_balances_of(record.name, &s)
+    }
+
+    pub(super) fn solana_balances_of(
+        &self,
+        wallet: String,
+        s: &Session<'_>,
+    ) -> Result<Value, String> {
         let lamports = s.rpc.balance(&s.owner)?;
         let accounts = s.rpc.token_accounts(&s.owner)?;
 
@@ -411,7 +428,7 @@ impl WalletService {
         ])];
         assets.extend(rows.into_iter().map(|(_, v)| v));
         let mut pairs = vec![
-            ("name", Value::String(record.name)),
+            ("name", Value::String(wallet)),
             ("address", Value::String(saddr::to_text(&s.owner))),
             ("network", network_json(s.network)),
             ("assets", Value::Array(assets)),

@@ -81,14 +81,26 @@ fn parse_digest(input: &str) -> Result<Digest, String> {
     Ok(digest)
 }
 
+/// How many times the gas budget is re-checked and raised before a failure is reported.
+const MAX_BUDGET_ADJUSTMENTS: u32 = 3;
+
 impl WalletService {
     pub(super) fn sui_session<'a>(&'a self, vault: &SuiVault) -> Result<Session<'a>, String> {
-        let gql = Gql::new(&*self.http, vault.network);
-        let chain = gql.verify_network(vault.network)?;
+        self.sui_session_for(vault.network, vault.address()?)
+    }
+
+    /// A session for reading an address, which needs no key.
+    pub(super) fn sui_session_for<'a>(
+        &'a self,
+        network: SuiNetwork,
+        owner: SuiAddress,
+    ) -> Result<Session<'a>, String> {
+        let gql = Gql::new(&*self.http, network);
+        let chain = gql.verify_network(network)?;
         Ok(Session {
             gql,
-            network: vault.network,
-            owner: vault.address()?,
+            network,
+            owner,
             chain,
         })
     }
@@ -257,6 +269,10 @@ impl WalletService {
     pub fn sui_balances(&self, name: &str, password: &str) -> Result<Value, String> {
         let (record, vault) = self.unlock_sui(name, password)?;
         let s = self.sui_session(&vault)?;
+        self.sui_balances_of(record.name, &s)
+    }
+
+    pub(super) fn sui_balances_of(&self, wallet: String, s: &Session<'_>) -> Result<Value, String> {
         let (balances, truncated) = s.gql.balances(&s.owner)?;
         let price_usd = if s.network.is_mainnet() {
             valuation::sui_price_usd(&*self.http)
@@ -353,7 +369,7 @@ impl WalletService {
             ));
         }
         let mut pairs = vec![
-            ("name", Value::String(record.name)),
+            ("name", Value::String(wallet)),
             ("address", Value::String(s.owner.to_string())),
             ("network", network_json(s.network)),
             ("assets", Value::Array(assets)),
@@ -406,7 +422,7 @@ impl WalletService {
         if spend.total() < u128::from(amount) {
             return Err(tx::insufficient(coin_type, u128::from(amount), spend));
         }
-        let sim_budget = tx::max_budget(sui).saturating_sub(spent_sui);
+        let sim_budget = tx::max_sim_budget(sui, spent_sui);
         if sim_budget < env.price.saturating_mul(2000) {
             return Err(
                 "not enough SUI to pay for gas (after the SUI being sent, if any)".to_string(),
@@ -423,12 +439,47 @@ impl WalletService {
             ));
         }
         let suggested = tx::budget_from_simulation(&dry.gas, env.price);
-        let budget = gas_budget.unwrap_or(suggested);
-        let (transaction, _) =
-            tx::assemble(s.owner, &env, budget, sui, coin_type, amount, spend, body)?;
-        let simulation = s.gql.simulate(&tx::encode(&transaction)?)?;
-        if !simulation.success {
-            let hint = if gas_budget.is_some() {
+        let mut budget = gas_budget.unwrap_or(suggested);
+        // What the transaction costs depends on which coins pay for it: the dry run above used
+        // the biggest budget the wallet could afford, so it merged many coins and earned a big
+        // storage rebate that a smaller budget (fewer coins) does not get. So the budget is
+        // checked against the transaction as it will really be sent, and raised when it falls
+        // short. A budget the caller chose is never changed.
+        let mut adjustments = 0;
+        loop {
+            let (transaction, _) =
+                tx::assemble(s.owner, &env, budget, sui, coin_type, amount, spend, body)?;
+            let simulation = s.gql.simulate(&tx::encode(&transaction)?)?;
+            if simulation.success {
+                if gas_budget.is_none() && adjustments < MAX_BUDGET_ADJUSTMENTS {
+                    let needed = tx::budget_from_simulation(&simulation.gas, env.price);
+                    if needed > budget {
+                        budget = needed;
+                        adjustments += 1;
+                        continue;
+                    }
+                }
+                return Ok(Prepared {
+                    transaction,
+                    simulation,
+                });
+            }
+            let short_of_gas = tx::is_gas_shortage(simulation.error.as_deref());
+            if gas_budget.is_none() && short_of_gas && adjustments < MAX_BUDGET_ADJUSTMENTS {
+                // The most it could need if no rebate were given, but never more than the
+                // wallet can pay once the amount is sent.
+                let affordable = tx::max_sim_budget(sui, spent_sui);
+                let widened = tx::budget_without_rebate(&dry.gas, env.price).min(affordable);
+                if widened > budget {
+                    budget = widened;
+                    adjustments += 1;
+                    continue;
+                }
+            }
+            let hint = if gas_budget.is_none() && short_of_gas {
+                " (the SUI left after sending cannot pay the network fee; send a little less)"
+                    .to_string()
+            } else if gas_budget.is_some() {
                 format!(
                     " (the gas_budget of {} SUI may be too low; a dry run suggests about {} SUI)",
                     coins::format_amount(u128::from(budget), coins::SUI_DECIMALS),
@@ -442,10 +493,6 @@ impl WalletService {
                 simulation.error.as_deref().unwrap_or("unknown reason")
             ));
         }
-        Ok(Prepared {
-            transaction,
-            simulation,
-        })
     }
 
     /// Signs and submits. Sui executes a given signed transaction at most once, so if the answer

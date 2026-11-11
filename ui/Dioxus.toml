@@ -1,0 +1,6 @@
+[application]
+
+[bundle]
+identifier = "io.github.danieljdev.agentsaifu"
+publisher = "agent-saifu"
+short_description = "All-in-one crypto wallet for agents."

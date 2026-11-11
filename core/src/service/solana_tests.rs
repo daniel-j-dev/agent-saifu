@@ -683,6 +683,17 @@ fn every_operation_leaves_the_vault_locked_on_disk() {
 // ---- balances -------------------------------------------------------------------------------
 
 #[test]
+fn a_public_view_refreshes_balances_without_the_password() {
+    let f = funded();
+    give_usdc(&f, 2_500_000);
+    let unlocked = f.service.solana_balances("w", PW).unwrap();
+    let view = f.service.public_view("w", PW).unwrap();
+    assert_eq!(view.address(), text(&unlocked, &["address"]));
+    assert_eq!(f.service.balances_of_view(&view).unwrap(), unlocked);
+    assert!(f.service.public_view("w", "wrong-password").is_err());
+}
+
+#[test]
 fn balances_list_sol_and_tokens_with_values() {
     let f = funded();
     give_usdc(&f, 2_500_000);

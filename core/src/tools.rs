@@ -1342,6 +1342,12 @@ impl Toolbox {
         }
     }
 
+    /// The wallet service behind the tools, for apps that also use its library-only calls
+    /// (such as `WalletService::public_view`).
+    pub fn service(&self) -> &WalletService {
+        &self.service
+    }
+
     pub fn list(&self) -> Value {
         Value::object(vec![(
             "tools",

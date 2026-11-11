@@ -188,7 +188,25 @@ impl WalletService {
             }
             let dry = s.gql.simulate(&tx::encode(&build(trial)?)?)?;
             if dry.success {
-                let budget = tx::budget_from_simulation(&dry.gas, env.price).min(ceiling);
+                let mut budget = tx::budget_from_simulation(&dry.gas, env.price).min(ceiling);
+                // The estimate came from a dry run that may have merged more coins (and earned
+                // more storage rebate) than the final transaction will, so check it against
+                // the transaction as built and raise it if it falls short.
+                for _ in 0..3 {
+                    let candidate = build(budget)?;
+                    let check = s.gql.simulate(&tx::encode(&candidate)?)?;
+                    let next = if check.success {
+                        tx::budget_from_simulation(&check.gas, env.price).min(ceiling)
+                    } else if tx::is_gas_shortage(check.error.as_deref()) {
+                        tx::budget_without_rebate(&dry.gas, env.price).min(ceiling)
+                    } else {
+                        return Ok(candidate);
+                    };
+                    if next <= budget {
+                        return Ok(candidate);
+                    }
+                    budget = next;
+                }
                 return build(budget);
             }
             failure = format!(

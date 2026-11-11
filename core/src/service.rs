@@ -47,6 +47,8 @@ mod sui_swap;
 #[cfg(test)]
 mod sui_tests;
 mod sui_wc;
+mod view;
+pub use view::PublicView;
 
 pub const MAX_FAILED_ATTEMPTS: u32 = 5;
 pub const LOCKOUT: Duration = Duration::from_secs(60);
@@ -415,7 +417,11 @@ impl WalletService {
     }
 
     pub(crate) fn network_of(contents: &VaultContents, chain_id: u64) -> Result<Network, String> {
-        networks::find_network(&contents.networks, chain_id).ok_or_else(|| {
+        Self::network_in(&contents.networks, chain_id)
+    }
+
+    fn network_in(custom: &[Network], chain_id: u64) -> Result<Network, String> {
+        networks::find_network(custom, chain_id).ok_or_else(|| {
             format!(
                 "this wallet has no network with chain ID {chain_id}; add it with add_network first"
             )
@@ -927,32 +933,47 @@ impl WalletService {
     ) -> Result<Value, String> {
         let (record, contents) = self.unlock(name, password)?;
         let owner = contents.address()?;
+        self.balances_of(
+            record.name,
+            &owner,
+            &contents.networks,
+            &contents.tokens,
+            chain_id,
+            token_contracts,
+        )
+    }
+
+    /// The balances answer for an address and the networks and tokens its wallet uses. Needs no
+    /// key, so it serves both `get_balances` and a password-free refresh of a `PublicView`.
+    pub(crate) fn balances_of(
+        &self,
+        wallet: String,
+        owner: &Address,
+        custom_networks: &[Network],
+        tokens: &[CustomToken],
+        chain_id: Option<u64>,
+        token_contracts: &[Address],
+    ) -> Result<Value, String> {
         let selected: Vec<Network> = match chain_id {
-            Some(id) => vec![Self::network_of(&contents, id)?],
-            None => networks::all_networks(&contents.networks),
+            Some(id) => vec![Self::network_in(custom_networks, id)?],
+            None => networks::all_networks(custom_networks),
         };
         let reports = selected
             .iter()
-            .map(|n| {
-                match ops::network_balances(
-                    &*self.http,
-                    n,
-                    &owner,
-                    &contents.tokens,
-                    token_contracts,
-                ) {
+            .map(
+                |n| match ops::network_balances(&*self.http, n, owner, tokens, token_contracts) {
                     Ok(v) => v,
                     Err(e) => Value::object(vec![
                         ("chain_id", num(n.chain_id)),
                         ("network", Value::str(&n.name)),
                         ("error", Value::String(e)),
                     ]),
-                }
-            })
+                },
+            )
             .collect();
         Ok(Value::object(vec![
-            ("name", Value::String(record.name)),
-            ("address", Value::String(to_checksum(&owner))),
+            ("name", Value::String(wallet)),
+            ("address", Value::String(to_checksum(owner))),
             ("networks", Value::Array(reports)),
             (
                 "note",
@@ -2445,6 +2466,22 @@ mod tests {
             1
         );
         assert!(f.service.get_balances("w", PW, Some(999), &[]).is_err());
+    }
+
+    #[test]
+    fn a_public_view_refreshes_balances_of_every_network_without_the_password() {
+        let f = l2_fixture();
+        create(&f, "w");
+        f.service.add_network("w", PW, base_network()).unwrap();
+        let unlocked = f.service.get_balances("w", PW, None, &[]).unwrap();
+        let view = f.service.public_view("w", PW).unwrap();
+        assert_eq!(view.wallet(), "w");
+        assert_eq!(
+            view.address(),
+            unlocked.get("address").and_then(Value::as_str).unwrap()
+        );
+        assert_eq!(f.service.balances_of_view(&view).unwrap(), unlocked);
+        assert!(f.service.public_view("w", "wrong-password").is_err());
     }
 
     #[test]

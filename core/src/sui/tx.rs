@@ -108,6 +108,18 @@ pub fn max_budget(sui: &Holdings) -> u64 {
     u64::try_from(available.min(u128::from(MAX_GAS_BUDGET))).unwrap_or(MAX_GAS_BUDGET)
 }
 
+/// The largest budget a dry run of a transaction that spends `spent_sui` of the wallet's SUI can
+/// use. Gas comes either from coin objects (which can be topped up from the address balance to
+/// cover what is spent) or, failing that, from the address balance alone, so the two parts of
+/// the balance must be counted together rather than one at a time.
+pub fn max_sim_budget(sui: &Holdings, spent_sui: u64) -> u64 {
+    let spent = u128::from(spent_sui);
+    let from_coins = sui.coin_total().min(sui.total().saturating_sub(spent));
+    let from_address = sui.address_balance.saturating_sub(spent);
+    let best = from_coins.max(from_address).min(u128::from(MAX_GAS_BUDGET));
+    u64::try_from(best).unwrap_or(MAX_GAS_BUDGET)
+}
+
 /// A gas budget given in whole SUI, as MIST. It may not exceed the protocol's maximum budget.
 pub fn parse_gas_budget(text: &str) -> Result<u64, String> {
     let budget =
@@ -134,6 +146,23 @@ pub fn budget_from_simulation(gas: &GasSummary, price: u64) -> u64 {
         .saturating_add(BUDGET_OVERHEAD_UNITS.saturating_mul(price));
     let with_storage = base.saturating_add(gas.storage).saturating_sub(gas.rebate);
     with_storage.max(base).min(MAX_GAS_BUDGET)
+}
+
+/// Budget that covers a transaction even if the network gave no storage rebate: computation,
+/// the usual margin and the whole storage charge.
+pub fn budget_without_rebate(gas: &GasSummary, price: u64) -> u64 {
+    gas.computation
+        .saturating_add(BUDGET_OVERHEAD_UNITS.saturating_mul(price))
+        .saturating_add(gas.storage)
+        .min(MAX_GAS_BUDGET)
+}
+
+/// Whether a failed dry run failed for lack of gas (as opposed to a problem with the transaction).
+pub fn is_gas_shortage(error: Option<&str>) -> bool {
+    error.is_some_and(|e| {
+        let squashed: String = e.chars().filter(|c| !c.is_whitespace()).collect();
+        squashed.to_ascii_lowercase().contains("insufficientgas")
+    })
 }
 
 fn struct_tag(coin_type: &str) -> Result<StructTag, String> {
@@ -736,6 +765,53 @@ pub mod tests {
         assert_eq!(max_budget(&holdings(&[], 7)), 7);
         assert_eq!(max_budget(&holdings(&[u64::MAX], 0)), MAX_GAS_BUDGET);
         assert_eq!(max_budget(&holdings(&[], 0)), 0);
+    }
+
+    #[test]
+    fn a_budget_without_rebate_covers_the_whole_storage_charge() {
+        let gas = GasSummary {
+            computation: 100_000,
+            storage: 1_976_000,
+            rebate: 1_975_000,
+        };
+        assert_eq!(
+            budget_without_rebate(&gas, 100),
+            100_000 + 100_000 + 1_976_000
+        );
+        assert!(budget_without_rebate(&gas, 100) >= budget_from_simulation(&gas, 100));
+        let huge = GasSummary {
+            computation: u64::MAX,
+            storage: 1,
+            rebate: 0,
+        };
+        assert_eq!(budget_without_rebate(&huge, 100), MAX_GAS_BUDGET);
+    }
+
+    #[test]
+    fn recognises_a_gas_shortage() {
+        assert!(is_gas_shortage(Some("Insufficient Gas.")));
+        assert!(is_gas_shortage(Some("InsufficientGas")));
+        assert!(!is_gas_shortage(Some("Move abort 5")));
+        assert!(!is_gas_shortage(None));
+    }
+
+    #[test]
+    fn a_dry_run_budget_counts_coins_and_address_balance_together() {
+        // Coins alone can pay gas and the address balance tops up what is spent.
+        assert_eq!(max_sim_budget(&holdings(&[12], 12), 21), 3);
+        assert_eq!(max_sim_budget(&holdings(&[12, 12], 0), 21), 3);
+        assert_eq!(max_sim_budget(&holdings(&[4, 3], 17), 21), 3);
+        // Gas can also come from the address balance alone.
+        assert_eq!(max_sim_budget(&holdings(&[], 24), 21), 3);
+        // Coins too small for the budget the address balance could pay.
+        assert_eq!(max_sim_budget(&holdings(&[2], 22), 21), 2);
+        // Nothing sent: the larger part pays.
+        assert_eq!(max_sim_budget(&holdings(&[10, 20], 5), 0), 30);
+        assert_eq!(max_sim_budget(&holdings(&[], 7), 0), 7);
+        // Spending everything or more leaves no gas.
+        assert_eq!(max_sim_budget(&holdings(&[5], 5), 10), 0);
+        assert_eq!(max_sim_budget(&holdings(&[5], 5), 11), 0);
+        assert_eq!(max_sim_budget(&holdings(&[u64::MAX], 0), 0), MAX_GAS_BUDGET);
     }
 
     #[test]

@@ -152,20 +152,28 @@ impl WalletService {
         &'a self,
         vault: &BitcoinVault,
     ) -> Result<BtcSession<'a>, String> {
-        let api = EsploraClient::new(&*self.http, vault.network.api_url())?;
+        self.bitcoin_session_for(vault.network, &vault.address_kind()?)
+    }
+
+    /// A session for reading an address, which needs no key.
+    pub(super) fn bitcoin_session_for<'a>(
+        &'a self,
+        network: BitcoinNetwork,
+        address: &Address,
+    ) -> Result<BtcSession<'a>, String> {
+        let api = EsploraClient::new(&*self.http, network.api_url())?;
         let genesis = api.genesis_hash()?;
-        if genesis != vault.network.genesis_hash() {
+        if genesis != network.genesis_hash() {
             return Err(format!(
                 "the Bitcoin API at {} does not serve {} (it reported another genesis block); refusing to use it",
                 api.host(),
-                network_label(vault.network)
+                network_label(network)
             ));
         }
-        let address = vault.address_kind()?;
         Ok(BtcSession {
             script: address.script_pubkey(),
-            address_text: address.to_text(vault.network),
-            network: vault.network,
+            address_text: address.to_text(network),
+            network,
             api,
         })
     }
@@ -327,6 +335,14 @@ impl WalletService {
     pub fn bitcoin_balances(&self, name: &str, password: &str) -> Result<Value, String> {
         let (record, vault) = self.unlock_bitcoin(name, password)?;
         let s = self.bitcoin_session(&vault)?;
+        self.bitcoin_balances_of(record.name, &s)
+    }
+
+    pub(super) fn bitcoin_balances_of(
+        &self,
+        wallet: String,
+        s: &BtcSession<'_>,
+    ) -> Result<Value, String> {
         let stats = s.api.address_stats(&s.address_text)?;
         let total = stats.confirmed + stats.pending;
         let to_sats = |value: i128| {
@@ -351,7 +367,7 @@ impl WalletService {
             ("usdc_value", self.btc_usd_json(s.network, total)),
         ]);
         Ok(Value::object(vec![
-            ("name", Value::String(record.name)),
+            ("name", Value::String(wallet)),
             ("address", Value::String(s.address_text.clone())),
             ("network", bitcoin_network_json(s.network)),
             ("assets", Value::Array(vec![asset])),
