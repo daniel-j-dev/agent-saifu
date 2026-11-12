@@ -87,6 +87,14 @@ dx bundle --release --platform android --no-default-features --features mobile
 
 The mobile builds have not been run on a device in this repository's CI yet.
 
+## Build it
+
+AppImage
+```bash
+dx bundle --desktop --release --package-types appimage
+```
+
+
 ## WalletConnect
 
 Pairing needs a WalletConnect project ID, exactly as for the MCP server: set `WALLETCONNECT_PROJECT_ID` or edit [`../core/src/walletconnect_config.rs`](../core/src/walletconnect_config.rs). The app checks for new requests every few seconds while it is open. Sessions live only while the app is running.
